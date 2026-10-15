@@ -1,8 +1,9 @@
 # Writes a real baseline JPEG: YCbCr, 8x8 DCT, quantization, zigzag, then Huffman coding.
-# Run: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444]
+# Run: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--optimize]
 import math
 import struct
 import sys
+import types
 
 # Annex K.1, in natural (row by row) order. Quality scales them; see quant_tables.
 LUMA_Q = [16, 11, 10, 16, 24, 40, 51, 61,
@@ -64,6 +65,61 @@ def huffman_codes(table):
             k += 1
         code <<= 1
     return codes
+
+
+def build_table(counts):
+    # Annex K.2 (figures K.1 to K.4), as libjpeg does it. counts holds 256 symbol counts.
+    # A dummy symbol 256 with count 1 takes the all-ones code, then is dropped; see DOCS.md.
+    freq = list(counts) + [1]
+    size, others = [0] * 257, [-1] * 257
+    while True:
+        # The two least frequent; ties go to the higher symbol, so the dummy ends up deepest.
+        c1 = max((i for i in range(257) if freq[i]), key=lambda i: (-freq[i], i))
+        rest = [i for i in range(257) if freq[i] and i != c1]
+        if not rest:
+            break
+        c2 = max(rest, key=lambda i: (-freq[i], i))
+        freq[c1] += freq[c2]
+        freq[c2] = 0
+        for c in (c1, c2):
+            size[c] += 1
+            while others[c] >= 0:
+                c = others[c]
+                size[c] += 1
+        c = c1
+        while others[c] >= 0:
+            c = others[c]
+        others[c] = c2
+    bits = [0] * (max(size) + 1)
+    for i in range(257):
+        if size[i]:
+            bits[size[i]] += 1
+    # K.3: while a code is longer than 16, move two leaves up and split a shorter leaf to make room.
+    for i in range(len(bits) - 1, 16, -1):
+        while bits[i]:
+            j = i - 2
+            while not bits[j]:
+                j -= 1
+            bits[i] -= 2
+            bits[i - 1] += 1
+            bits[j + 1] += 2
+            bits[j] -= 1
+    bits = (bits + [0] * 17)[:17]
+    # Drop the dummy: it is last in code order, so it takes one code from the longest length.
+    longest = max(i for i in range(17) if bits[i])
+    bits[longest] -= 1
+    values = bytes(i for length in range(1, max(size) + 1) for i in range(256) if size[i] == length)
+    return bits[1:], values
+
+
+class Tally:
+    # Stands in for a code table on the first pass: counts each symbol asked for, codes nothing.
+    def __init__(self):
+        self.counts = [0] * 256
+
+    def __getitem__(self, symbol):
+        self.counts[symbol] += 1
+        return 0, 0
 
 
 def ycbcr(r, g, b):
@@ -168,8 +224,9 @@ def segment(marker, body):
     return struct.pack(">HH", marker, len(body) + 2) + body
 
 
-def encode(rgb, width, height, quality=75, subsample=True):
+def encode(rgb, width, height, quality=75, subsample=True, optimize=False):
     # rgb is width * height * 3 bytes, row by row. Returns the bytes of a JFIF file.
+    # optimize counts this picture's symbols first and builds its own Huffman tables from them.
     if not (0 < width < 65536 and 0 < height < 65536) or len(rgb) != width * height * 3:
         raise ValueError("rgb must be width * height * 3 bytes, each side 1 to 65535")
     luma_q, chroma_q = quant_tables(quality)
@@ -177,22 +234,33 @@ def encode(rgb, width, height, quality=75, subsample=True):
     y_plane, cb, cr = planes(rgb, width, height, mcu)
     if subsample:
         cb, cr = halve(cb), halve(cr)
-    dc_l, ac_l, dc_c, ac_c = (huffman_codes(t) for t in (DC_LUMA, AC_LUMA, DC_CHROMA, AC_CHROMA))
-    w = BitWriter()
-    prev = [0, 0, 0]
 
     def block(plane, x0, y0):
         return [plane[y0 + j][x0 + i] for j in range(8) for i in range(8)]
 
     # Interleaved: each MCU holds its luma blocks left to right, top to bottom, then one Cb and one Cr.
+    blocks = []
     for my in range(0, len(y_plane), mcu):
         for mx in range(0, len(y_plane[0]), mcu):
             for dy in range(0, mcu, 8):
                 for dx in range(0, mcu, 8):
-                    prev[0] = encode_block(w, coefficients(block(y_plane, mx + dx, my + dy), luma_q), prev[0], dc_l, ac_l)
+                    blocks.append((0, coefficients(block(y_plane, mx + dx, my + dy), luma_q)))
             cx, cy = (mx // 2, my // 2) if subsample else (mx, my)
-            prev[1] = encode_block(w, coefficients(block(cb, cx, cy), chroma_q), prev[1], dc_c, ac_c)
-            prev[2] = encode_block(w, coefficients(block(cr, cx, cy), chroma_q), prev[2], dc_c, ac_c)
+            blocks.append((1, coefficients(block(cb, cx, cy), chroma_q)))
+            blocks.append((2, coefficients(block(cr, cx, cy), chroma_q)))
+
+    def code(w, dc_l, ac_l, dc_c, ac_c):
+        prev = [0, 0, 0]
+        for c, zz in blocks:
+            prev[c] = encode_block(w, zz, prev[c], *((dc_l, ac_l) if c == 0 else (dc_c, ac_c)))
+
+    tables = (DC_LUMA, AC_LUMA, DC_CHROMA, AC_CHROMA)
+    if optimize:
+        tallies = [Tally() for _ in tables]
+        code(types.SimpleNamespace(write=lambda value, n: None), *tallies)
+        tables = [build_table(t.counts) for t in tallies]
+    w = BitWriter()
+    code(w, *(huffman_codes(t) for t in tables))
     w.flush()
 
     luma_sampling = 0x22 if subsample else 0x11
@@ -202,7 +270,7 @@ def encode(rgb, width, height, quality=75, subsample=True):
         segment(0xFFDB, b"\x00" + bytes(luma_q[z] for z in ZIGZAG) + b"\x01" + bytes(chroma_q[z] for z in ZIGZAG)),
         segment(0xFFC0, struct.pack(">BHHB", 8, height, width, 3) + bytes([1, luma_sampling, 0, 2, 0x11, 1, 3, 0x11, 1])),
         segment(0xFFC4, b"".join(bytes([tc_th]) + bytes(t[0]) + t[1] for tc_th, t in
-                                 ((0x00, DC_LUMA), (0x10, AC_LUMA), (0x01, DC_CHROMA), (0x11, AC_CHROMA)))),
+                                 zip((0x00, 0x10, 0x01, 0x11), tables))),
         segment(0xFFDA, bytes([3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0])),
         bytes(w.out),
         b"\xff\xd9",
@@ -213,14 +281,16 @@ if __name__ == "__main__":
     argv = sys.argv[1:]
     args = [a for i, a in enumerate(argv) if not a.startswith("-") and (i == 0 or argv[i - 1] not in ("-o", "-q"))]
     if not args:
-        sys.exit("usage: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444]")
+        sys.exit("usage: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--optimize]")
     from PIL import Image  # only to read the input picture; the JPEG is all this file
     source = args[0]
     out = argv[argv.index("-o") + 1] if "-o" in argv else source.rsplit(".", 1)[0] + ".jpg"
     quality = int(argv[argv.index("-q") + 1]) if "-q" in argv else 75
     image = Image.open(source).convert("RGB")
-    packed = encode(image.tobytes(), image.width, image.height, quality, subsample="--444" not in argv)
+    packed = encode(image.tobytes(), image.width, image.height, quality, subsample="--444" not in argv,
+                    optimize="--optimize" in argv)
     open(out, "wb").write(packed)
     raw = image.width * image.height * 3
     print(f"{source}: {image.width}x{image.height}, {raw} bytes of pixels -> {len(packed)} bytes "
-          f"({raw / len(packed):.1f} to 1), quality {quality}, {'4:4:4' if '--444' in argv else '4:2:0'}")
+          f"({raw / len(packed):.1f} to 1), quality {quality}, {'4:4:4' if '--444' in argv else '4:2:0'}"
+          f"{', optimized tables' if '--optimize' in argv else ''}")

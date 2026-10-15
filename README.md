@@ -25,6 +25,11 @@ Huffman coded.
 - Zigzag order, DC as differences, AC as (zeros before, size) pairs with
   end-of-block and sixteen-zero codes.
 - The standard Annex K Huffman tables, and a 0x00 after every 0xFF in the data.
+- `--optimize` (or `optimize=True`), like `jpegtran -optimize`: a first pass
+  counts the symbols this picture uses, Huffman tables are built for them by
+  the procedure in Annex K.2 (codes at most 16 bits, none all ones), and a
+  second pass writes the data with them. Without it the output is byte for
+  byte what it was before the option existed.
 - The file around it: SOI, APP0 (JFIF), DQT, SOF0, DHT, SOS, EOI.
 
 ## How it compares
@@ -51,19 +56,41 @@ are headers only: Pillow writes six table segments where this writes two. At
 quality 100, ours is a little less exact on hard black and white edges; DOCS.md
 has the numbers.
 
+With `--optimize`, against the standard tables and against Pillow's own
+`optimize=True` at the same quality and subsampling (whole files, in bytes):
+
+| picture | quality | standard | optimized | Pillow optimized |
+| --- | --- | --- | --- | --- |
+| ray-traced render 640x360, 4:2:0 | 25 | 9,187 | 7,483 | 7,459 |
+| | 50 | 12,929 | 11,587 | 11,561 |
+| | 75 | 18,254 | 17,350 | 17,409 |
+| | 90 | 29,940 | 29,141 | 29,453 |
+| ray-traced render 640x360, 4:4:4 | 75 | 21,669 | 19,779 | 19,993 |
+| text-like 64x64, 4:2:0 | 75 | 2,370 | 1,931 | 1,945 |
+| colour stripes 48x32, 4:4:4 | 75 | 1,399 | 771 | 793 |
+| noise 17x9, 4:4:4 | 75 | 880 | 549 | 567 |
+
+On the render that is 5% smaller at quality 75 and 19% at quality 25. Every
+optimized file is decoded by Pillow to exactly the same pixels as the
+standard one, because only the coding changed. The pass costs no measurable
+time: the render took a median 2.11 seconds standard and 1.97 optimized,
+alternating five of each in one process, with more spread between runs (1.86
+to 2.81) than between the two.
+
 It is slow, being pure Python: 1.9 seconds for the render at 4:2:0 and 3.2 at
 4:4:4, median of five in one process.
 
 ## Running it
 
-    python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444]
+    python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--optimize]
     python test_jpeg.py
 
-Pillow reads the PNG on the command line. Everything after the pixels, the
+`--optimize` builds Huffman tables for the picture instead of using the
+standard ones: smaller files, the same pixels. Pillow reads the PNG on the command line. Everything after the pixels, the
 whole JPEG, is this file and the standard library.
 
 ## Notes
 
 [DOCS.md](DOCS.md) is what writing it taught me, including why a flat colour
-can come back worse at quality 50 than at 25, and the 32 ways I broke the code
+can come back worse at quality 50 than at 25, and the 44 ways I broke the code
 on purpose to see whether the tests noticed.

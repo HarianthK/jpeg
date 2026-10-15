@@ -133,6 +133,7 @@ gives four tables, DC and AC for luma and chroma, built from statistics of a set
 of test pictures. They are not optimal for any one picture, but they are what
 most encoders use by default, Pillow included unless asked to optimize, which is
 why the coded data here comes out within 3% of Pillow's from quality 25 to 90.
+With `--optimize` it builds its own; see below.
 
 As in DEFLATE, a table is sent as counts: how many codes of each length 1 to 16,
 then the symbols in order. Both sides build the same canonical codes from that.
@@ -228,9 +229,121 @@ The padding breakage is the weakest catch. Repeating the first column instead of
 the last only changes pixels nobody sees. It made 11 checks fail, all on the
 17x9 and 33x21 pictures, through the extra ringing and bits it causes there.
 
+## Optimized Huffman tables
+
+`--optimize` does what `jpegtran -optimize` and libjpeg's `optimize_coding`
+do. The coefficients are worked out once and kept. A first pass runs them
+through the same `encode_block` that writes the file, but with a stand-in for
+each code table that counts every symbol asked for and writes nothing. So the
+counts cannot disagree with what the second pass sends: there is no second
+copy of the run-length logic to drift. Then four tables are built from the
+counts, and the second pass writes the data and the DHT with them.
+
+### Why per-image tables help
+
+The Annex K tables were built from someone else's pictures. They give every
+one of the 162 AC symbols a code, used or not, and their lengths match average
+statistics, not these. On the ray-traced render at quality 75 and 4:2:0 the
+coded data went from 17,645 bytes to 17,007 (3.6%), and the DHT from 420 bytes
+to 154, because it lists only the symbols used. At quality 25 the data went
+from 8,578 to 7,171 (16%): low quality makes far more zeros and EOBs than the
+standard tables expect, so their lengths are further off. On a small picture
+the table is most of the saving. The flat colour drops from 636 bytes to 279,
+and 279 is exactly 16 bytes under Pillow's optimized file, the same header
+difference as before, so the tables and data come to the same size as
+libjpeg's.
+
+### The 16-bit limit
+
+DHT sends how many codes have each length from 1 to 16, so no code may be
+longer. Plain Huffman has no such limit. Counts that grow like Fibonacci
+numbers make each merge swallow the last one, and the tree goes one level
+deeper per symbol. The test uses 30 counts starting 2, 3, 5: with the dummy's 1
+added, a plain Huffman built with `heapq` in the test is 30 deep.
+
+Annex K.3 fixes the lengths afterwards. While there is a code longer than 16,
+take two sibling codes at that length. One moves up into their parent's place.
+The other goes beside a code from the longest shorter length that has one,
+which becomes two codes one bit longer. Each step keeps the code space exactly
+full. The Fibonacci table comes out as BITS 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,
+1, 1, 2, 15. The render did not need it, but came close: its longest code was
+13 bits at quality 25 and 15 bits at quality 90, both in the luma AC table.
+
+The arithmetic in that step is easy to get wrong in a way that never ends:
+adding one leaf instead of two below made the loop spin forever, so the test
+builds the tables in a thread with a ten second limit and reports a build
+that does not finish.
+
+### The all-ones code
+
+The standard forbids a code made only of one bits, so that the ones used to
+pad the last byte (and the 0xFF before a marker) can never read as a whole
+code. libjpeg's answer, which is in K.2, is a dummy symbol 256 with count 1.
+Ties between equal counts go to the higher symbol, so the dummy is always
+taken first and ends up deepest. After the lengths are counted, one code is
+taken off the longest length. Canonical codes run upwards, so the code removed
+is the last one, the all-ones code. The dummy is never sent and never listed.
+
+That gives three properties the test checks from the outside, on a table
+worked by hand, one symbol alone, the Fibonacci counts, and random counts of
+2, 5, 40 and 162 symbols:
+
+- every symbol with a count is listed once, and no other;
+- the Kraft sum of the lengths is 1 minus one code of the longest length, so
+  the code is complete except one slot;
+- no code is all ones, and none is the start of another.
+
+The hand table is counts 4, 2, 1. With the dummy's 1: the dummy and C merge
+into 2, that and B into 4, that and A into 8. So A is 0, B is 10, C is 110,
+and 111 is the dummy's, left unused. The one-symbol table gets the code 0 and
+not an empty code, because the dummy gives it something to merge with.
+
+The test also bounds the cost of each table with a separate Huffman: at least
+what plain Huffman on the counts needs, and with no limit needed, no more than
+plain Huffman on the counts plus the dummy.
+
+### Breaking it on purpose
+
+As before, one breakage at a time, on the encoder, with the test run against
+it and the encoder restored after each:
+
+| breakage | caught by |
+| --- | --- |
+| K.3 length limit not applied | symbols lost from the Fibonacci table; Fibonacci cost below Huffman |
+| no dummy symbol, nothing removed | hand table; all-ones code; Kraft sum; one symbol gets no code; Pillow could not read 54 files |
+| luma blocks counted into the chroma tables | the second pass found symbols with no code (KeyError) |
+| Cr blocks not counted | the same, on 51 files |
+| DHT written from the standard tables | Pillow decoded different pixels (92 files) |
+| `optimize` silently ignored | optimized file not smaller than the standard one |
+| K.3 adds one leaf below, not two | the Fibonacci build did not finish |
+| dummy taken from the shortest length | Kraft sum; hand table; cost against Huffman |
+| DC prediction carried over from the counting pass | Pillow decoded different pixels; missing symbols |
+| `--optimize` ignored on the command line | command line check |
+| optimize on by default | the hash of every default file; optimized not smaller |
+| ties go to the lower symbol | nothing |
+
+The last one passed, and I left it. The point of the tie rule is that the dummy
+ends up deepest, so the code taken off the longest length is its own. With the
+other rule the dummy can sit higher up, and a real symbol is then listed at a
+length it was not built with. But the removal works on the count of lengths,
+not on the dummy, so what is sent is still a valid code with the all-ones slot
+free, and every check on it still holds. It can only cost bits. I kept the
+libjpeg rule because then the lengths are exactly the tree's.
+
+The first three runs taught me about the test, not the code. The missing dummy
+first crashed the test with `max()` of an empty list on the one-symbol table,
+and the K.3 slip hung it, which is why the table checks now run in a thread
+with a time limit and report either as a failure. Counting from the wrong
+component never makes a bad file: the second pass stops with KeyError on a
+symbol its table does not have, and the whole-file loop reports that and
+carries on. With no dummy, the command line check is still the one place a
+file Pillow cannot read stops the run, but it is the last check.
+
+To show the default output is unchanged, the test hashes every file it writes
+without `optimize` and compares the hash with the one I recorded from the
+encoder before the option existed. The coefficients are now worked out before
+any are coded, but the order and the bits are the same.
+
 ## What it does not do
 
-Progressive JPEG, restart markers, optimized Huffman tables, greyscale output
-and EXIF are all left out. Optimized tables would be the next step for size:
-count the symbols this picture actually uses and build a table for them, the
-same code the gzip project already has.
+Progressive JPEG, restart markers, greyscale output and EXIF are all left out.

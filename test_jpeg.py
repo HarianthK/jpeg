@@ -1,10 +1,13 @@
 # Run: python test_jpeg.py. Every file we write is decoded by Pillow, never by this project.
+import hashlib
+import heapq
 import io
 import math
 import os
 import random
 import subprocess
 import sys
+import threading
 
 from PIL import Image, JpegImagePlugin
 
@@ -105,6 +108,72 @@ ac_l = jpeg.huffman_codes(jpeg.AC_LUMA)
 check({s: as_bits(ac_l[s]) for s in (0x00, 0x01, 0x02, 0x03, 0x05, 0x11, 0xF0, 0xFA)} ==
       {0x00: "1010", 0x01: "00", 0x02: "01", 0x03: "100", 0x05: "11010", 0x11: "1100",
        0xF0: "11111111001", 0xFA: "1111111111111110"}, "AC luma codes")
+
+
+def huffman_cost(counts):
+    # Plain Huffman with a heap, no length limit: the total bits is the sum of every merged weight.
+    heap, cost = [c for c in counts if c], 0
+    heapq.heapify(heap)
+    while len(heap) > 1:
+        merged = heapq.heappop(heap) + heapq.heappop(heap)
+        cost += merged
+        heapq.heappush(heap, merged)
+    return cost
+
+
+def huffman_depth(counts):
+    # The longest code plain Huffman gives, to show a distribution really needs the 16-bit limit.
+    heap = [(c, 0) for c in counts if c]
+    heapq.heapify(heap)
+    while len(heap) > 1:
+        (a, da), (b, db) = heapq.heappop(heap), heapq.heappop(heap)
+        heapq.heappush(heap, (a + b, max(da, db) + 1))
+    return heap[0][1]
+
+
+def check_built(name, counts):
+    # The rules of K.2, checked from BITS and the code strings, not by rebuilding. The build runs
+    # in a thread with a time limit, so one that crashes or loops forever is reported, not fatal.
+    result = []
+    worker = threading.Thread(target=lambda: result.append(jpeg.build_table(counts + [0] * (256 - len(counts)))), daemon=True)
+    worker.start()
+    worker.join(10)
+    if not result:
+        check(False, f"{name}: build_table crashed or did not finish")
+        return [0] * 16, b"", math.inf
+    bits, values = result[0]
+    used = [i for i, c in enumerate(counts) if c]
+    check(len(bits) == 16 and sum(bits) == len(values) and sorted(values) == used, f"{name}: symbols {list(values)}, BITS {bits}")
+    longest = max(i + 1 for i in range(16) if bits[i])
+    # Complete except one slot: the lengths fill the code space but for one code of the longest length.
+    check(sum(n << (16 - (i + 1)) for i, n in enumerate(bits)) == (1 << 16) - (1 << (16 - longest)), f"{name}: Kraft sum, BITS {bits}")
+    codes = {s: as_bits(c) for s, c in jpeg.huffman_codes((bits, values)).items()}
+    check(all(set(c) != {"1"} for c in codes.values()), f"{name}: an all-ones code")
+    check(not any(a != b and b.startswith(a) for a in codes.values() for b in codes.values()), f"{name}: not prefix free")
+    cost = sum(counts[s] * len(c) for s, c in codes.items())
+    return bits, values, cost
+
+
+# One table by hand. Counts 4, 2, 1 plus the dummy's 1: the dummy and C merge (2), then that and
+# B (4), then that and A. So A is 0, B 10, C 110, and 111 is the dummy's, left unused.
+bits, values, _ = check_built("hand table", [4, 2, 1])
+check(bits == [1, 1, 1] + [0] * 13 and values == bytes([0, 1, 2]), f"hand table: BITS {bits}, values {list(values)}")
+# One symbol alone still gets a one-bit code, 0, because the dummy takes 1.
+bits, values, _ = check_built("one symbol", [0, 0, 0, 9])
+check(bits == [1] + [0] * 15 and values == b"", f"one symbol: BITS {bits}")
+# Fibonacci counts from 2, 3: with the dummy's 1, each merge swallows the last, 30 bits deep.
+fib = [2, 3]
+while len(fib) < 30:
+    fib.append(fib[-1] + fib[-2])
+check(huffman_depth(fib + [1]) > 16, "the Fibonacci counts do not need the length limit")
+_, _, cost = check_built("Fibonacci counts", fib)
+check(cost >= huffman_cost(fib), "Fibonacci table beats Huffman, which cannot be")
+# With no limit needed, the table costs no less than Huffman and no more than Huffman with the dummy.
+for n in (2, 5, 40, 162):
+    counts = [rng.randrange(1, 1000) for _ in range(n)]
+    _, _, cost = check_built(f"{n} random counts", counts)
+    check(huffman_cost(counts) <= cost <= huffman_cost(counts + [1]), f"{n} random counts: {cost} bits is not Huffman's")
+
 # Byte stuffing and the padding of the last byte with ones.
 w = jpeg.BitWriter()
 w.write(0xFF, 8)
@@ -160,7 +229,8 @@ check(jpeg.coefficients([-5] * 64, [16] * 64)[:2] == [-3, 0], "-2.5 did not roun
 # Now whole files, each decoded by Pillow, measured against the pixels and against Pillow's
 # own encoder at the same quality and subsampling.
 QUALITIES = (10, 25, 50, 75, 90, 100)
-rows = []
+rows, sizes = [], []
+default_files = hashlib.sha256()
 for label, image in IMAGES.items():
     pixels = image.tobytes()
     big = image.width * image.height > 10000
@@ -168,6 +238,7 @@ for label, image in IMAGES.items():
         scores = []
         for quality in ((25, 50, 75, 90) if big else QUALITIES):
             data = jpeg.encode(pixels, image.width, image.height, quality, subsample)
+            default_files.update(data)
             where = f"{label}, q{quality}, {'4:2:0' if subsample else '4:4:4'}"
             try:
                 ours = theirs_decode(data)
@@ -193,13 +264,32 @@ for label, image in IMAGES.items():
                 check(mine >= other - (0.3 if quality < 100 else 3.5), f"{where}: PSNR {mine:.2f} dB, Pillow's {other:.2f} dB")
                 check(len(data) < 1.05 * len(buf.getvalue()) + 40, f"{where}: {len(data)} bytes, Pillow's {len(buf.getvalue())}")
             rows.append((label, quality, subsample, len(data), len(buf.getvalue()), mine, other))
+            # Optimized tables change only the coding, so Pillow must decode exactly the same pixels.
+            try:
+                tuned = jpeg.encode(pixels, image.width, image.height, quality, subsample, optimize=True)
+                same = theirs_decode(tuned).tobytes() == ours.tobytes()
+            except Exception as e:
+                check(False, f"{where}, optimized: {e!r}")
+                continue
+            check(same, f"{where}: optimized tables decode to different pixels")
+            check(len(tuned) < len(data), f"{where}: optimized {len(tuned)} bytes, standard {len(data)}")
+            buf = io.BytesIO()
+            image.save(buf, "JPEG", quality=quality, subsampling=2 if subsample else 0, optimize=True)
+            check(len(tuned) <= len(buf.getvalue()) + 40, f"{where}: optimized {len(tuned)} bytes, Pillow's {len(buf.getvalue())}")
+            sizes.append((label, quality, subsample, len(data), len(tuned), len(buf.getvalue())))
         # Not for one-coefficient pictures: their error depends on where they fall between steps.
         if "flat" not in label and "worst" not in label:
             check(all(a < b for a, b in zip(scores, scores[1:])), f"{label}: PSNR does not rise with quality: {scores}")
 
+# Without --optimize every file is byte for byte what the encoder wrote before the option existed.
+check(default_files.hexdigest() == "93ed0e5b179ad8802d5d0a028e01bdfddfc48a8081c20b96ad3baad0cb035715",
+      "default output changed")
 print(f"{'image':26} {'q':>3} {'sub':5} {'ours':>7} {'Pillow':>7} {'ours dB':>8} {'Pillow dB':>9}")
 for label, quality, subsample, mine, other, p1, p2 in rows:
     print(f"{label:26} {quality:>3} {'4:2:0' if subsample else '4:4:4':5} {mine:>7} {other:>7} {p1:>8.2f} {p2:>9.2f}")
+print(f"{'image':26} {'q':>3} {'sub':5} {'standard':>8} {'optimized':>9} {'Pillow optimized':>16}")
+for label, quality, subsample, standard, tuned, pil in sizes:
+    print(f"{label:26} {quality:>3} {'4:2:0' if subsample else '4:4:4':5} {standard:>8} {tuned:>9} {pil:>16}")
 
 # Bad input is refused, not encoded into a broken file.
 for args in ((b"\0" * 5, 1, 2), (b"", 0, 0), (b"\0" * 3, 1, 1, 0)):
@@ -220,12 +310,19 @@ try:
     written = theirs_decode(open("t-out.jpg", "rb").read())
     check(written.size == (17, 9) and JpegImagePlugin.get_sampling(written) == 0, "command line ignored --444")
     check(list(written.quantization[0]) == jpeg.quant_tables(40)[0], "command line ignored -q")
+    run = subprocess.run([sys.executable, jpeg.__file__, "t-in.png", "-o", "t-opt.jpg", "-q", "40", "--444", "--optimize"],
+                         capture_output=True, text=True)
+    check(run.returncode == 0 and "optimized" in run.stdout, f"command line --optimize: {run}")
+    if os.path.exists("t-opt.jpg"):
+        tuned = open("t-opt.jpg", "rb").read()
+        check(len(tuned) < os.path.getsize("t-out.jpg") and theirs_decode(tuned).tobytes() == written.tobytes(),
+              "command line ignored --optimize")
     run = subprocess.run([sys.executable, jpeg.__file__, "t-in.png"], capture_output=True, text=True)
     check(run.returncode == 0 and os.path.exists("t-in.jpg"), "default output name")
     if os.path.exists("t-in.jpg"):
         check(JpegImagePlugin.get_sampling(theirs_decode(open("t-in.jpg", "rb").read())) == 2, "default is not 4:2:0")
 finally:
-    for name in ("t-in.png", "t-out.jpg", "t-in.jpg"):
+    for name in ("t-in.png", "t-out.jpg", "t-in.jpg", "t-opt.jpg"):
         if os.path.exists(name):
             os.remove(name)
 print("the command line writes what it is told to")
