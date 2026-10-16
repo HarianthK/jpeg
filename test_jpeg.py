@@ -1,4 +1,5 @@
-# Run: python test_jpeg.py. Every file we write is decoded by Pillow, never by this project.
+# Run: python test_jpeg.py. Every file we write is decoded by Pillow, never by this project,
+# and decode() is measured against Pillow's decoding of files Pillow wrote.
 import hashlib
 import heapq
 import io
@@ -326,6 +327,201 @@ finally:
         if os.path.exists(name):
             os.remove(name)
 print("the command line writes what it is told to")
+
+# Reading. decode() is tested on files Pillow (libjpeg) wrote, and its pixels are compared with
+# Pillow's own decoding of the same file. They differ by a few levels; DOCS.md has why.
+def pillow_jpeg(image, **options):
+    buf = io.BytesIO()
+    image.save(buf, "JPEG", **options)
+    return buf.getvalue()
+
+
+def our_decode(data, where):
+    try:
+        return jpeg.decode(data)
+    except Exception as e:
+        check(False, f"{where}: decode raised {e!r}")
+
+
+readings = []
+
+
+def against_pillow(data, where, worst=3):
+    # Per channel, the largest difference from Pillow's decoding, and the PSNR between the two.
+    # The floors sit about a decibel under the lowest I measured; upsampling costs the most.
+    floor = 51 if "4:2:" in where else 57
+    got = our_decode(data, where)
+    if got is None:
+        return
+    theirs = theirs_decode(data)
+    width, height, rgb = got
+    check((width, height) == theirs.size, f"{where}: size {width}x{height}, Pillow {theirs.size}")
+    other = theirs.convert("RGB").tobytes()
+    if len(rgb) != len(other):
+        check(False, f"{where}: {len(rgb)} bytes of pixels, Pillow {len(other)}")
+        return
+    most = [max(abs(a - b) for a, b in zip(rgb[c::3], other[c::3])) for c in range(3)]
+    score = psnr(rgb, other)
+    check(max(most) <= worst and score >= floor, f"{where}: off from Pillow by {most}, {score:.2f} dB")
+    readings.append((where, most, score))
+
+
+SAMPLINGS = {0: "4:4:4", 1: "4:2:2", 2: "4:2:0"}
+for label, image in IMAGES.items():
+    big = image.width * image.height > 10000
+    for sub, name in SAMPLINGS.items():
+        for quality in ((75,) if big else (10, 50, 90, 100)):
+            against_pillow(pillow_jpeg(image, quality=quality, subsampling=sub), f"{label}, q{quality}, {name}")
+    grey = image.convert("L")
+    # Greyscale has no colour step and no upsampling, so only the IDCTs differ: within 1.
+    for quality in ((75,) if big else (10, 90)):
+        against_pillow(pillow_jpeg(grey, quality=quality), f"{label}, q{quality}, greyscale", worst=1)
+    against_pillow(pillow_jpeg(image, quality=75, optimize=True), f"{label}, q75, 4:2:0, optimize")
+# Pillow's keep_rgb writes R, G and B themselves, marked by an Adobe segment, with no colour step.
+for label in ("gradient 33x21", "colour stripes 48x32"):
+    against_pillow(pillow_jpeg(IMAGES[label], quality=75, keep_rgb=True), f"{label}, q75, 4:4:4, keep_rgb")
+# A flat colour at 4:4:4 is one DC value per block, so only rounding can tell the two apart.
+for quality in (50, 90, 100):
+    against_pillow(pillow_jpeg(IMAGES["flat colour 40x24"], quality=quality, subsampling=0), f"flat colour, q{quality}, 4:4:4, exact", worst=0)
+    against_pillow(pillow_jpeg(make(24, 16, lambda x, y: (90, 90, 90)), quality=quality, subsampling=0), f"flat grey, q{quality}, 4:4:4, exact", worst=0)
+
+# Restart markers: DC prediction starts again at each, and Pillow can put one every few MCUs.
+for label in ("gradient 33x21", "colour stripes 48x32", "trace-rays render 640x360"):
+    if label not in IMAGES:
+        continue
+    for sub, options in ((2, dict(restart_marker_blocks=1)), (0, dict(restart_marker_blocks=3)), (1, dict(restart_marker_rows=1))):
+        data = pillow_jpeg(IMAGES[label], quality=75, subsampling=sub, **options)
+        check(b"\xff\xdd" in data and b"\xff\xd1" in data, f"{label}: Pillow wrote no restart markers for {options}")
+        against_pillow(data, f"{label}, q75, {SAMPLINGS[sub]}, {', '.join(f'{k}={v}' for k, v in options.items())}")
+# Our own encoder's files as well, though never only them.
+for label in ("gradient 33x21", "noise 17x9"):
+    image = IMAGES[label]
+    for subsample in (True, False):
+        against_pillow(jpeg.encode(image.tobytes(), image.width, image.height, 75, subsample), f"{label}, ours, q75, {'4:2:0' if subsample else '4:4:4'}")
+
+print(f"{'decoded against Pillow':64} {'max R, G, B':>12} {'dB':>7}")
+for where, most, score in readings:
+    if "render" in where or "keep_rgb" in where:
+        print(f"{where:64} {str(most):>12} {score:>7.2f}")
+for kind in ("4:4:4", "4:2:2", "4:2:0", "greyscale"):
+    group = [(m, sc) for w, m, sc in readings if kind in w]
+    print(f"{kind}: {len(group)} files, largest difference {max(max(m) for m, _ in group)}, lowest {min(sc for _, sc in group):.2f} dB")
+print(f"{len(readings)} files, largest difference {max(max(m) for _, m, _ in readings)}, lowest {min(s for *_, s in readings):.2f} dB")
+
+
+def refused(data, why, words=""):
+    # Broken input must raise ValueError with a reason, never anything else and never decode.
+    try:
+        jpeg.decode(data)
+        check(False, f"{why}: decoded without complaint")
+    except ValueError as e:
+        check(words.lower() in str(e).lower(), f"{why}: refused, but with {str(e)!r}")
+    except Exception as e:
+        check(False, f"{why}: raised {e!r} instead of ValueError")
+
+
+def segments(data):
+    # Offsets of the first of each marker up to SOS, so a test can patch one segment.
+    pos, found = 2, {}
+    while data[pos + 1] != 0xDA:
+        found.setdefault(data[pos + 1], pos)
+        pos += 2 + int.from_bytes(data[pos + 2:pos + 4], "big")
+    found[0xDA] = pos
+    return found
+
+
+small = pillow_jpeg(IMAGES["noise 17x9"], quality=75)
+at = segments(small)
+# A lone component is never interleaved, so marking it 2x2 must change nothing; libjpeg agrees.
+grey = pillow_jpeg(IMAGES["gradient 33x21"].convert("L"), quality=75)
+patched = bytearray(grey)
+patched[segments(grey)[0xC0] + 11] = 0x22
+against_pillow(bytes(patched), "gradient 33x21, greyscale marked 2x2 sampling", worst=1)
+check(our_decode(bytes(patched), "greyscale marked 2x2") == our_decode(grey, "greyscale"), "a lone component's sampling changed the pixels")
+sos = at[0xDA]
+scan_start = sos + 2 + int.from_bytes(small[sos + 2:sos + 4], "big")
+refused(small[:len(small) // 2], "truncated file", "end")
+refused(small[2:], "missing SOI", "SOI")
+refused(small[:2] + b"\xff\xf7\x00\x02" + small[2:], "unknown marker 0xFFF7", "0xFFF7")
+refused(small[:sos] + b"\xff\xc4\x00\x16\x00" + bytes([3] + [0] * 15) + b"\x00\x01\x02" + small[sos:], "DHT with 3 one-bit codes", "more codes")
+refused(small[:sos] + b"\xff\xc4\x01\x14\x00" + bytes([0] * 14 + [2, 255]) + bytes(257) + small[sos:], "DHT with 257 codes", "256")
+patched = bytearray(small)
+patched[sos + 6] = 0x33
+refused(bytes(patched), "scan uses Huffman tables 3, never defined", "never defined")
+patched = bytearray(small)
+patched[at[0xC0] + 12] = 3
+refused(bytes(patched), "frame uses quantization table 3, never defined", "never defined")
+refused(pillow_jpeg(IMAGES["noise 17x9"], quality=75, streamtype=2), "Pillow's abbreviated file, no tables", "never defined")
+# Ones from the first scan byte on: longer than any DC luma code in Annex K, so it matches nothing.
+refused(small[:scan_start] + b"\xff\x00" * 4 + small[scan_start + 8:], "a code that matches nothing", "matches nothing")
+refused(pillow_jpeg(IMAGES["noise 17x9"], quality=75, progressive=True), "Pillow's progressive file", "progressive")
+for marker, words in ((0xC9, "arithmetic"), (0xC3, "lossless"), (0xC2, "progressive"), (0xC1, "extended")):
+    patched = bytearray(small)
+    patched[at[0xC0] + 1] = marker
+    refused(bytes(patched), f"SOF0 marked 0xFF{marker:02X}", words)
+patched = bytearray(small)
+patched[at[0xC0] + 4] = 12
+refused(bytes(patched), "12-bit precision", "12-bit")
+refused(small.replace(b"\xff\xd9", b""), "no EOI", "ends")
+restarts = pillow_jpeg(IMAGES["gradient 33x21"], quality=75, restart_marker_blocks=1)
+i = restarts.index(b"\xff\xd1")
+refused(restarts[:i] + b"\xff\xd2" + restarts[i + 2:], "restart markers out of order", "restart")
+# Any marker may have extra 0xFF fill bytes in front (B.1.1.2), a restart marker too.
+check(our_decode(restarts.replace(b"\xff\xd1", b"\xff\xff\xff\xd1"), "fill bytes") == our_decode(restarts, "restarts"), "fill bytes before RST1 changed the pixels")
+for n in range(len(small)):
+    refused(small[:n], f"cut to {n} of {len(small)} bytes")
+print(f"every one of the {len(small)} truncations of a {len(small)}-byte file is refused")
+# Cut inside the coded data but with EOI put back, so only running out of bits can tell.
+for n in range(scan_start, len(small) - 2):
+    refused(small[:n] + b"\xff\xd9", f"scan cut to {n - scan_start} bytes, EOI kept", "ends in the middle")
+
+
+def tiny(dc, ac, scan):
+    # An 8x8 greyscale JPEG by hand: every divisor 1, and symbol k's code is k ones then a zero.
+    hand = lambda tc, symbols: bytes([tc << 4] + [1] * len(symbols) + [0] * (16 - len(symbols)) + symbols)
+    return b"".join([b"\xff\xd8", jpeg.segment(0xFFDB, b"\x00" + b"\x01" * 64),
+                     jpeg.segment(0xFFC0, bytes([8, 0, 8, 0, 8, 1, 1, 0x11, 0])),
+                     jpeg.segment(0xFFC4, hand(0, dc) + hand(1, ac)),
+                     jpeg.segment(0xFFDA, bytes([1, 1, 0x00, 0, 63, 0])), scan, b"\xff\xd9"])
+
+
+# DC size 3, bits 101 (5), then EOB, padded with ones: 0 101 0 111. DC 5 is 5 / 8 over 128, so 129.
+by_hand = tiny([3], [0x00], b"\x57")
+check(our_decode(by_hand, "hand-built 8x8") == (8, 8, b"\x81" * 192) and theirs_decode(by_hand).tobytes() == b"\x81" * 64, "hand-built 8x8 is not 129 everywhere")
+# A DC difference of size 12 and an AC value of size 11 do not fit 8-bit samples.
+refused(tiny([12], [0x00], b"\x40\x03"), "DC difference of size 12", "bigger")
+refused(tiny([0], [0x0B, 0x00], b"\x20\x05"), "AC value of size 11", "bigger")
+fuzz, decoded = random.Random(11), 0
+for n in range(300):
+    target = restarts if n % 2 else small
+    broken = bytearray(target)
+    for _ in range(fuzz.choice((1, 1, 2, 4))):
+        broken[fuzz.randrange(2, len(broken))] ^= 1 << fuzz.randrange(8)
+    try:
+        width, height, rgb = jpeg.decode(bytes(broken))
+        check(len(rgb) == 3 * width * height, f"flip {n}: {width}x{height} but {len(rgb)} bytes")
+        decoded += 1
+    except ValueError:
+        pass
+    except Exception as e:
+        check(False, f"flip {n}: raised {e!r}")
+print(f"300 bit-flipped files: {decoded} decoded to something, the rest refused with ValueError")
+
+# The command line: -d reads a JPEG and writes the PNG Pillow then reads back.
+open("t-in.jpg", "wb").write(small)
+try:
+    run = subprocess.run([sys.executable, jpeg.__file__, "-d", "t-in.jpg", "-o", "t-out.png"], capture_output=True, text=True)
+    check(run.returncode == 0 and "17x9" in run.stdout, f"command line -d: {run}")
+    if os.path.exists("t-out.png"):
+        check(Image.open("t-out.png").convert("RGB").tobytes() == jpeg.decode(small)[2], "command line -d wrote other pixels")
+    open("t-bad.jpg", "wb").write(small[:100])
+    run = subprocess.run([sys.executable, jpeg.__file__, "-d", "t-bad.jpg"], capture_output=True, text=True)
+    check(run.returncode != 0 and "end of the file" in run.stderr and "Traceback" not in run.stderr, f"command line -d on a broken file: {run}")
+finally:
+    for name in ("t-in.jpg", "t-out.png", "t-bad.jpg", "t-bad.png"):
+        if os.path.exists(name):
+            os.remove(name)
+print("the decoder reads what Pillow writes")
 
 print("FAILURES" if failures else "ok")
 sys.exit(1 if failures else 0)

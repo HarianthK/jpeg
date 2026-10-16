@@ -1,4 +1,4 @@
-# What I learned writing a JPEG encoder
+# What I learned writing a JPEG encoder and decoder
 
 ## Colour is split before anything is thrown away
 
@@ -344,6 +344,193 @@ without `optimize` and compares the hash with the one I recorded from the
 encoder before the option existed. The coefficients are now worked out before
 any are coded, but the order and the bits are the same.
 
+## Reading it back
+
+`decode(data)` returns the width, the height and the RGB pixels of a baseline
+JPEG, and `python jpeg.py -d IN.jpg -o OUT.png` writes them out (Pillow only
+writes the PNG). It reads SOF0 with 8-bit samples, one component (greyscale)
+or three (YCbCr) at 4:4:4, 4:2:2 or 4:2:0, the DQT, DHT, SOS and DRI segments,
+restart markers and byte stuffing, and skips APPn and COM. The steps are the
+encoder's run backwards: Huffman codes to (zeros, size) pairs, zigzag undone,
+times the table, inverse DCT, chroma upsampled, YCbCr to RGB.
+
+### Testing only on other people's files
+
+The rule from the encoder is turned around, as it was for inflate in the
+deflate project: the decoder is tested on files Pillow (libjpeg) wrote, and
+its pixels are compared with Pillow's own decoding of the same file. If it
+were tested on this project's files, an encoder and a decoder that shared a
+misreading of the standard would agree with each other and pass. The files
+cover every picture in the test at qualities 10, 50, 90 and 100 (the render at
+75), each of Pillow's three subsamplings, greyscale, `optimize=True`, restart
+markers every MCU, every three MCUs and every MCU row (Pillow 12.3 calls the
+options `restart_marker_blocks` and `restart_marker_rows`), odd sizes 17x9 and
+33x21, and the ray-traced render re-encoded by Pillow. It reads this
+project's own files too, but never only them.
+
+### The trust boundary
+
+An encoder only sees pixels it was handed. A decoder reads whatever bytes
+arrive, so every length, count and table id in the file is checked before it
+is used, and a broken file raises `ValueError` with a reason. The test has a
+hand-built case for each: a cut file, no SOI, an unknown marker, a DHT with
+three one-bit codes, a DHT with 257 codes, Huffman and quantization tables
+that were never defined (one of them Pillow's own abbreviated file, written
+with `streamtype=2`), a run of ones that matches no code, restart markers out
+of order, and a DC difference and an AC value too big for 8-bit samples. Then
+every one of the 773 truncations of a 773-byte Pillow file, the scan cut at
+each of its 148 bytes with the EOI put back, and 300 seeded random bit flips
+across two files. Of the flips, 191 still decode to a picture of the right
+size and every other one is refused with `ValueError`, never anything else.
+
+A file can also be valid and simply not baseline. Progressive, arithmetic
+coded, lossless, hierarchical, extended (SOF1) and 12-bit files are refused by
+name, for example "progressive (SOF2) JPEGs are not supported, only baseline
+(SOF0)". The test checks that wording on Pillow's own `progressive=True`
+file, and on a real file with its SOF0 marker or precision byte changed.
+
+Sizes in the header are not trusted either. One flipped bit can turn a width of
+17 into 32,785, so the sample rows are made one MCU row at
+a time as the data arrives, and a header that promises more than the data
+holds runs out of bits before it has cost much memory.
+
+### Running out of bits, and a misleading message
+
+Each restart interval's coded bytes are turned into a string of bits, with
+padding after the end so that peeking 16 bits ahead is always safe, and after
+each block the reader checks it has not gone past the real end. I first
+padded with ones. Then I broke the decoder by removing that end check, and no
+test failed: a truncated file had lost its EOI, so it was refused before
+decoding started. So I added the scan cut short with the EOI put back. With
+ones as padding, all but one of those cuts were refused with "a Huffman code
+matches nothing", because the all-ones code is the one every table leaves out. That
+is true and useless to someone with a cut-off download. libjpeg pads with
+zeros, and the all-zeros code always exists, so running out reads as ordinary
+codes until the block check says "the scan data ends in the middle of a
+block". With zeros, all 148 cuts give that message, and removing the end check
+fails all 148.
+
+### Restart markers
+
+DRI sets an interval in MCUs. After each interval the encoder pads to a whole
+byte, writes RST0 to RST7 in turn, and starts every DC prediction again from
+zero, so damage in one interval cannot spread into the next. The reader finds
+the markers first, while it removes the stuffing, so each interval is decoded
+from its own bits, and it checks there are exactly as many markers as the
+interval needs, in order. Pillow's `restart_marker_blocks=1` on the render
+writes 919 of them, one between each pair of its 920 MCUs. With the DC
+prediction carried across a marker, the render came back at 8.65 dB against
+Pillow's decoding, and only the restart files failed. A marker may have extra
+0xFF fill bytes in front of it, and the test puts two before RST1.
+
+### Why it differs from Pillow by a few levels
+
+Three steps round differently. libjpeg's default inverse DCT is in integers
+(`JDCT_ISLOW`) and this one is in floats. libjpeg converts colour with integer
+tables and this uses the JFIF equations in floats. And libjpeg rounds the
+upsampled chroma to whole numbers before converting it, where this keeps the
+fractions. On the render at quality 75, the share of the 691,200 values that
+come out exactly equal to Pillow's:
+
+| file | exact | 1 off | 2 off | 3 off | PSNR between the two |
+| --- | --- | --- | --- | --- | --- |
+| greyscale | 99.38% | 0.62% | 0 | 0 | 70.24 dB |
+| 4:4:4 | 99.11% | 0.79% | 0.09% | 2 values | 67.49 dB |
+| 4:2:2 | 91.50% | 8.40% | 0.10% | 5 values | 58.69 dB |
+| 4:2:0 | 86.71% | 13.17% | 0.12% | 9 values | 56.77 dB |
+
+The jump at 4:2:2 is the chroma rounding. To check that, I rounded the
+upsampled chroma the way libjpeg's `h2v1_fancy_upsample` does, adding 1 or 2
+before dividing by 4, and 4:2:2 went to 685,436 exact out of 691,200, 99.17%,
+the same as 4:4:4. I kept the fractions, which are closer to the arithmetic,
+and the test allows for the difference instead.
+
+Over all 131 files in the test (127 written by Pillow, 4 by this
+encoder), no value is more than 3 levels from
+Pillow's, and the lowest PSNR between the two decodings is 51.90 dB (the
+colour stripes at quality 100, 4:2:2). The test asks for at most 3 levels
+everywhere, at least 57 dB at 4:4:4 and 51 dB with subsampling (each about a
+decibel under the lowest measured), within 1 level for greyscale, and exactly
+Pillow's values for a flat colour and a flat grey at 4:4:4, where only the DC
+value is decoded and both decoders agree to the level.
+
+Upsampling is libjpeg's "fancy" kind, its default: each new chroma sample is
+3/4 of the nearer old sample and 1/4 of the next one out, with the edge
+sample repeated. Plain replication, each chroma sample copied to its 2x2
+square, is simpler, and on the smooth render it still gets 53.74 dB against
+Pillow, but it is up to 17 levels off at colour edges, and on the colour
+stripes it falls to 17.39 dB. Either way the bound catches it.
+
+Three-component files are YCbCr unless an Adobe APP14 segment says transform
+0, which means R, G and B. Pillow writes that with `keep_rgb=True`, and the
+test reads two such files.
+
+It is slow: the render takes 1.27 seconds at 4:2:0, 1.47 at 4:4:4 and 0.44 in
+greyscale (median of five, alternating, in one process), against about 1.2
+milliseconds for Pillow. The inverse DCT skips columns that are all zero.
+
+### Breaking the decoder on purpose
+
+As with the encoder, one breakage at a time on a copy, with the reading tests
+run against it:
+
+| breakage | caught by |
+| --- | --- |
+| zigzag not undone | bound against Pillow (109 files) |
+| DC prediction not reset at a restart marker | bound against Pillow, only the 9 restart files |
+| byte stuffing not removed | bound against Pillow; "ends in the middle of a block" on clean files |
+| chroma taken from the next MCU's block | bound against Pillow (69 files) |
+| IDCT transposed | bound against Pillow, greyscale too |
+| Cr to red 1.42, not 1.402 | bound against Pillow (53 files); flat colour exact |
+| Cb to green 0.334136, not 0.344136 | bound against Pillow (23 files); flat colour exact |
+| replication, not fancy upsampling | bound against Pillow at 4:2:2 and 4:2:0 (47 files) |
+| fancy upsampling with the neighbours swapped | bound against Pillow (47 files) |
+| negative values not extended | bound against Pillow, every file |
+| ZRL counting 15 zeros | bound against Pillow (42 files) |
+| no level shift | bound against Pillow, every file |
+| inverse DCT output not clamped | bound against Pillow (42 files) |
+| canonical codes not shifted between lengths | "matches nothing" on every file |
+| Huffman overflow check removed | the DHT with three one-bit codes (by its message) |
+| 256-code limit removed | the DHT with 257 codes (by its message) |
+| end-of-data check removed | at first nothing; then all 148 cut scans with EOI kept |
+| DC and AC size limits removed | at first nothing; then the two hand-built tiny files |
+| restart marker order not checked | restart markers out of order |
+| DRI ignored | every restart file refused |
+| SOI not checked | missing SOI (by its message) |
+| unknown markers skipped | unknown marker 0xFFF7 |
+| SOF2 read as SOF0, spectral check removed | Pillow's progressive file; SOF0 marked SOF2 decoded |
+| precision not checked | 12-bit precision decoded |
+| a lone component keeps its 2x2 factors | greyscale marked 2x2 against Pillow and against itself |
+| chroma size rounded down, not up | 17x9 and 33x21 at 4:2:2 and 4:2:0 |
+| SOF width and height swapped | sizes against Pillow |
+| fill bytes before a marker not skipped | at first nothing; then fill bytes before RST1 |
+| Adobe transform ignored | the two `keep_rgb` files |
+| `-d` ignored on the command line | command line checks |
+| a broken file raising past the command line | command line on a broken file |
+
+Three breakages passed at first, and each one was a hole in the tests, not in
+the code. The end check is the story above. The size limits were never
+reached by any real file, so the test now builds two 8x8 files by hand, with
+one code per table and the bits written out, that use a DC difference of size
+12 and an AC value of size 11. The same builder makes a valid file by hand: DC
+size 3, bits 101, so DC 5, which is 5/8 over 128 and rounds to 129 in every
+pixel, and Pillow agrees. Fill bytes were handled twice over, by the scan
+reader and by the marker loop, so removing one made no difference until a
+fill byte sat in front of a restart marker, inside the scan.
+
+Some catches are only by the error message. With the Huffman overflow check
+removed, a table with three one-bit codes is still refused, but later and for
+a wrong reason ("more than 64 coefficients"): assigning to a slice past the
+end of a Python list grows the list instead of failing, so the bad table was
+built without complaint. That is why the refusal checks look at the reason,
+not only at the exception type.
+
 ## What it does not do
 
-Progressive JPEG, restart markers, greyscale output and EXIF are all left out.
+The encoder writes no progressive files, no restart markers, no greyscale
+files and no EXIF. The decoder refuses progressive, arithmetic coded,
+lossless, hierarchical, extended (SOF1) and 12-bit files, files with one scan
+per component, sampling other than 1x or 2x the chroma (4:1:1), and four
+components (CMYK). It ignores EXIF orientation and ICC profiles. A file with
+no JFIF or Adobe segment and components named R, G and B is read as YCbCr,
+where libjpeg would read it as RGB.

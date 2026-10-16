@@ -1,5 +1,5 @@
-# Writes a real baseline JPEG: YCbCr, 8x8 DCT, quantization, zigzag, then Huffman coding.
-# Run: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--optimize]
+# Writes and reads baseline JPEGs: YCbCr, 8x8 DCT, quantization, zigzag, then Huffman coding.
+# Run: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--optimize], or -d IN.jpg [-o OUT.png]
 import math
 import struct
 import sys
@@ -277,13 +277,298 @@ def encode(rgb, width, height, quality=75, subsample=True, optimize=False):
     ])
 
 
+# Reading. Everything from here on trusts nothing in the file; see DOCS.md.
+REFUSED = {0xC1: "extended sequential (SOF1)", 0xC2: "progressive (SOF2)", 0xC3: "lossless (SOF3)",
+           0xC9: "arithmetic coded (SOF9)", 0xCA: "progressive arithmetic coded (SOF10)",
+           0xCB: "lossless arithmetic coded (SOF11)", 0xCC: "arithmetic coded (DAC)", 0xDC: "DNL marker"}
+REFUSED.update({m: f"hierarchical (marker 0xFF{m:02X})" for m in (0xC5, 0xC6, 0xC7, 0xCD, 0xCE, 0xCF, 0xDE, 0xDF)})
+BYTE_BITS = [format(i, "08b") for i in range(256)]
+
+
+def lookup_table(counts, symbols):
+    # A list indexed by the next 16 bits; every entry that starts with a code's bits holds (symbol, length).
+    table, code, k = [None] * 65536, 0, 0
+    for length in range(1, 17):
+        for _ in range(counts[length - 1]):
+            if code >= 1 << length:
+                raise ValueError("a Huffman table has more codes than its lengths leave room for")
+            shift = 16 - length
+            table[code << shift:(code + 1) << shift] = [(symbols[k], length)] * (1 << shift)
+            code += 1
+            k += 1
+        code <<= 1
+    return table
+
+
+def read_tables(marker, body, qt, huff):
+    # DQT and DHT may each hold several tables back to back.
+    while body:
+        kind, slot = body[0] >> 4, body[0] & 15
+        if marker == 0xDB:
+            if kind:
+                raise ValueError("16-bit quantization tables (12-bit JPEG) are not supported")
+            if slot > 3 or len(body) < 65:
+                raise ValueError("a DQT segment is cut short or has a table id above 3")
+            qt[slot], body = list(body[1:65]), body[65:]
+            continue
+        if kind > 1 or slot > 3 or len(body) < 17:
+            raise ValueError("a DHT segment is cut short or has a bad table class or id")
+        counts = body[1:17]
+        total = sum(counts)
+        if total > 256 or len(body) < 17 + total:
+            raise ValueError("a DHT segment lists more than 256 codes or is cut short")
+        huff[kind, slot] = lookup_table(counts, body[17:17 + total])
+        body = body[17 + total:]
+
+
+def read_frame(body):
+    # SOF0: precision, height, width, then (id, sampling, table) per component.
+    if len(body) < 6:
+        raise ValueError("the SOF0 segment is cut short")
+    precision, height, width, n = struct.unpack(">BHHB", body[:6])
+    if precision != 8:
+        raise ValueError(f"{precision}-bit samples are not supported, only 8-bit")
+    if not (width and height):
+        raise ValueError("a width or height of 0 (height set later by DNL) is not supported")
+    if n not in (1, 3) or len(body) != 6 + 3 * n:
+        raise ValueError(f"{n} components are not supported, only 1 (greyscale) or 3 (YCbCr)")
+    comps = [dict(id=body[i], h=body[i + 1] >> 4, v=body[i + 1] & 15, tq=body[i + 2]) for i in range(6, 6 + 3 * n, 3)]
+    if n == 1:
+        comps[0].update(h=1, v=1)  # a lone component is never interleaved, so its factors mean nothing
+    hmax, vmax = max(c["h"] for c in comps), max(c["v"] for c in comps)
+    for c in comps:
+        if not (c["h"] and c["v"]) or hmax % c["h"] or vmax % c["v"] or hmax // c["h"] > 2 or vmax // c["v"] > 2:
+            raise ValueError(f"sampling factors {[(c['h'], c['v']) for c in comps]} are not supported")
+    if len({c["id"] for c in comps}) != n:
+        raise ValueError("two components share an id")
+    return width, height, comps
+
+
+def entropy_data(data, pos):
+    # The coded bytes up to the next marker, 0xFF 0x00 turned back into 0xFF, split at each RSTn.
+    pieces, rsts, piece = [], [], bytearray()
+    while True:
+        i = data.find(b"\xff", pos)
+        if i < 0 or i + 1 >= len(data):
+            raise ValueError("the file ends inside the scan data")
+        piece += data[pos:i]
+        after = data[i + 1]
+        if after == 0:
+            piece.append(0xFF)
+            pos = i + 2
+        elif after == 0xFF:
+            pos = i + 1
+        elif 0xD0 <= after <= 0xD7:
+            pieces.append(piece)
+            rsts.append(after - 0xD0)
+            piece, pos = bytearray(), i + 2
+        else:
+            pieces.append(piece)
+            return pieces, rsts, i
+
+
+def idct(coef):
+    # The inverse of fdct, M^T F M: down each column that holds anything, then along the rows.
+    g = [([sum(DCT[v][y] * col[v] for v in range(8) if col[v]) for y in range(8)], DCT[u])
+         for u in range(8) for col in (coef[u::8],) if any(col)]
+    return [min(max(int(sum(c[y] * m[x] for c, m in g) + 128.5), 0), 255) for y in range(8) for x in range(8)]
+
+
+def read_block(bits, pos, dc, ac, q):
+    # One block: the DC difference, then (zeros, size) pairs to EOB, dequantized into natural order.
+    coef = [0] * 64
+    k = 0
+    while k < 64:
+        entry = (ac if k else dc)[int(bits[pos:pos + 16], 2)]
+        if entry is None:
+            raise ValueError("a Huffman code in the scan data matches nothing in its table")
+        symbol, n = entry
+        pos += n
+        run, size = (0, symbol) if k == 0 else (symbol >> 4, symbol & 15)
+        if size > (11 if k == 0 else 10):
+            raise ValueError("a coefficient is bigger than 8-bit baseline allows")
+        if k and not size:
+            if run != 15:
+                break
+            k += 16
+            continue
+        k += run
+        if k > 63:
+            raise ValueError("a block has more than 64 coefficients")
+        value = int(bits[pos:pos + size], 2) if size else 0
+        pos += size
+        if size and value < 1 << (size - 1):
+            value -= (1 << size) - 1
+        coef[k] = value
+        k += 1
+    return pos, coef
+
+
+def read_scan(data, pos, body, frame, qt, huff, interval):
+    # Decodes the one interleaved scan into a plane of samples per component, padded to whole MCUs.
+    width, height, comps = frame
+    ns = body[0] if body else 0
+    if not ns or len(body) != 4 + 2 * ns:
+        raise ValueError("the SOS segment has the wrong length")
+    if tuple(body[-3:]) != (0, 63, 0):
+        raise ValueError("a scan of part of the spectrum (progressive) is not supported")
+    if ns != len(comps):
+        raise ValueError("scans that do not hold every component are not supported")
+    by_id = {c["id"]: c for c in comps}
+    scan = []
+    for i in range(1, 1 + 2 * ns, 2):
+        c = by_id.pop(body[i], None)
+        if c is None:
+            raise ValueError(f"the scan names component {body[i]}, which is not in the frame or is named twice")
+        td, ta = body[i + 1] >> 4, body[i + 1] & 15
+        for kind, table, key, slot in (("quantization", qt, c["tq"], c["tq"]), ("DC Huffman", huff, (0, td), td),
+                                       ("AC Huffman", huff, (1, ta), ta)):
+            if key not in table:
+                raise ValueError(f"component {c['id']} uses {kind} table {slot}, which was never defined")
+        scan.append((c, huff[0, td], huff[1, ta], qt[c["tq"]]))
+    hmax, vmax = max(c["h"] for c in comps), max(c["v"] for c in comps)
+    mcux, mcuy = -(-width // (8 * hmax)), -(-height // (8 * vmax))
+    total = mcux * mcuy
+    interval = interval or total
+    pieces, rsts, end_pos = entropy_data(data, pos)
+    if len(rsts) != -(-total // interval) - 1 or rsts != [i % 8 for i in range(len(rsts))]:
+        raise ValueError(f"expected {-(-total // interval) - 1} restart markers in order, found {len(rsts)} numbered {rsts[:8]}")
+    planes = [[] for _ in scan]
+    mcu = 0
+    for piece in pieces:
+        bits = "".join(map(BYTE_BITS.__getitem__, piece))
+        end = len(bits)
+        # Zeros past the end (as libjpeg does) always read as some code, so running out is caught
+        # by the check after each block, not mistaken for a bad code. One block reads < 2048 bits.
+        bits += "0" * 2048
+        pos, pred = 0, [0] * ns
+        for _ in range(min(interval, total - mcu)):
+            my, mx = divmod(mcu, mcux)
+            for s, (c, dc, ac, q) in enumerate(scan):
+                h, v, plane = c["h"], c["v"], planes[s]
+                if mx == 0:
+                    plane += [bytearray(mcux * h * 8) for _ in range(8 * v)]
+                for j in range(v):
+                    for i in range(h):
+                        pos, zz = read_block(bits, pos, dc, ac, q)
+                        if pos > end:
+                            raise ValueError("the scan data ends in the middle of a block")
+                        pred[s] += zz[0]
+                        zz[0] = pred[s]
+                        coef = [0] * 64
+                        for k in range(64):
+                            if zz[k]:
+                                coef[ZIGZAG[k]] = zz[k] * q[k]
+                        samples = idct(coef)
+                        x0, y0 = (mx * h + i) * 8, (my * v + j) * 8
+                        for r in range(8):
+                            plane[y0 + r][x0:x0 + 8] = bytes(samples[8 * r:8 * r + 8])
+            mcu += 1
+    return [(c, plane) for (c, *_), plane in zip(scan, planes)], end_pos
+
+
+def stretch(s):
+    # Fancy upsampling, as libjpeg does by default: each new sample is 3/4 the nearer old one
+    # and 1/4 the next one out, with the edge sample repeated.
+    s = list(s)
+    return [v for a, b, c in zip(s[:1] + s[:-1], s, s[1:] + s[-1:]) for v in ((3 * b + a) / 4, (3 * b + c) / 4)]
+
+
+def to_rgb(frame, planes, is_rgb):
+    width, height, comps = frame
+    hmax, vmax = max(c["h"] for c in comps), max(c["v"] for c in comps)
+    flat = []
+    for c, plane in planes:
+        cw, ch = -(-width * c["h"] // hmax), -(-height * c["v"] // vmax)
+        rows = [list(r[:cw]) for r in plane[:ch]]
+        if hmax // c["h"] == 2:
+            rows = [stretch(r) for r in rows]
+        if vmax // c["v"] == 2:
+            rows = list(zip(*map(stretch, zip(*rows))))
+        flat.append([v for r in rows[:height] for v in r[:width]])
+    rgb = bytearray(3 * width * height)
+    if len(flat) == 1:
+        rgb[0::3] = rgb[1::3] = rgb[2::3] = bytes(flat[0])
+        return bytes(rgb)
+    if is_rgb:
+        for c, plane in enumerate(flat):
+            rgb[c::3] = bytes(min(max(int(v + 0.5), 0), 255) for v in plane)
+        return bytes(rgb)
+    # JFIF's inverse, the same equations libjpeg uses, rounded and clamped to 0..255.
+    y, cb, cr = flat
+    rgb[0::3] = bytes(min(max(int(a + 1.402 * (r - 128) + 0.5), 0), 255) for a, r in zip(y, cr))
+    rgb[1::3] = bytes(min(max(int(a - 0.344136 * (b - 128) - 0.714136 * (r - 128) + 0.5), 0), 255) for a, b, r in zip(y, cb, cr))
+    rgb[2::3] = bytes(min(max(int(a + 1.772 * (b - 128) + 0.5), 0), 255) for a, b in zip(y, cb))
+    return bytes(rgb)
+
+
+def decode(data):
+    # Returns width, height and the RGB pixels, row by row, of a baseline JPEG. Anything else
+    # (progressive, arithmetic, 12-bit, lossless, broken) is refused with a ValueError.
+    data = bytes(data)
+    if data[:2] != b"\xff\xd8":
+        raise ValueError("not a JPEG: it does not start with SOI (FF D8)")
+    qt, huff, frame, planes, interval, pos, transform = {}, {}, None, None, 0, 2, 1
+    while True:
+        if pos >= len(data):
+            raise ValueError("the file ends before the EOI marker")
+        if data[pos] != 0xFF:
+            raise ValueError(f"expected a marker at byte {pos}, found 0x{data[pos]:02X}")
+        while pos < len(data) and data[pos] == 0xFF:
+            pos += 1
+        if pos >= len(data):
+            raise ValueError("the file ends before the EOI marker")
+        marker, start = data[pos], pos - 1
+        pos += 1
+        if marker == 0xD9:
+            break
+        if marker in REFUSED:
+            raise ValueError(f"{REFUSED[marker]} JPEGs are not supported, only baseline (SOF0)")
+        if marker not in (0xC0, 0xC4, 0xDA, 0xDB, 0xDD, 0xFE) and not 0xE0 <= marker <= 0xEF:
+            raise ValueError(f"unknown marker 0xFF{marker:02X} at byte {start}")
+        n = int.from_bytes(data[pos:pos + 2], "big")
+        if n < 2 or pos + n > len(data):
+            raise ValueError(f"the segment at byte {start} runs past the end of the file")
+        body, pos = data[pos + 2:pos + n], pos + n
+        if marker in (0xDB, 0xC4):
+            read_tables(marker, body, qt, huff)
+        elif marker == 0xEE and body[:5] == b"Adobe" and len(body) >= 12:
+            transform = body[11]  # 0 means the three components are R, G and B, not YCbCr
+        elif marker == 0xDD:
+            if len(body) != 2:
+                raise ValueError("the DRI segment has the wrong length")
+            interval = int.from_bytes(body, "big")
+        elif marker == 0xC0:
+            if frame:
+                raise ValueError("the file has two frames")
+            frame = read_frame(body)
+        elif marker == 0xDA:
+            if frame is None or planes is not None:
+                raise ValueError("a scan before the frame header, or a second scan, is not supported")
+            planes, pos = read_scan(data, pos, body, frame, qt, huff, interval)
+    if planes is None:
+        raise ValueError("the file has no scan (SOS)")
+    return frame[0], frame[1], to_rgb(frame, planes, transform == 0)
+
+
 if __name__ == "__main__":
     argv = sys.argv[1:]
     args = [a for i, a in enumerate(argv) if not a.startswith("-") and (i == 0 or argv[i - 1] not in ("-o", "-q"))]
     if not args:
-        sys.exit("usage: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--optimize]")
-    from PIL import Image  # only to read the input picture; the JPEG is all this file
+        sys.exit("usage: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--optimize]\n"
+                 "       python jpeg.py -d IN.jpg [-o OUT.png]")
+    from PIL import Image  # only to read or write the PNG; the JPEG is all this file
     source = args[0]
+    if "-d" in argv:
+        out = argv[argv.index("-o") + 1] if "-o" in argv else source.rsplit(".", 1)[0] + ".png"
+        packed = open(source, "rb").read()
+        try:
+            width, height, rgb = decode(packed)
+        except ValueError as e:
+            sys.exit(f"{source}: {e}")
+        Image.frombytes("RGB", (width, height), rgb).save(out)
+        print(f"{source}: {len(packed)} bytes -> {width}x{height}, {len(rgb)} bytes of pixels, written to {out}")
+        sys.exit()
     out = argv[argv.index("-o") + 1] if "-o" in argv else source.rsplit(".", 1)[0] + ".jpg"
     quality = int(argv[argv.index("-q") + 1]) if "-q" in argv else 75
     image = Image.open(source).convert("RGB")

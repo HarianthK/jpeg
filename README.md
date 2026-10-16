@@ -1,7 +1,8 @@
 # jpeg
 
-A baseline JPEG encoder written from the bits up, in one Python file with no
-dependencies. It writes real `.jpg` files that any viewer opens.
+A baseline JPEG encoder and decoder written from the bits up, in one Python
+file with no dependencies. It writes real `.jpg` files that any viewer opens,
+and reads baseline files other programs wrote.
 
     $ python jpeg.py ../trace-rays/render.png -o render.jpg
     ../trace-rays/render.png: 640x360, 691200 bytes of pixels -> 18254 bytes (37.9 to 1), quality 75, 4:2:0
@@ -31,6 +32,19 @@ Huffman coded.
   second pass writes the data with them. Without it the output is byte for
   byte what it was before the option existed.
 - The file around it: SOI, APP0 (JFIF), DQT, SOF0, DHT, SOS, EOI.
+
+Reading, with `decode(data)` or `-d`:
+
+- Baseline sequential files (SOF0), 8-bit, greyscale or YCbCr at 4:4:4, 4:2:2
+  or 4:2:0, and RGB files marked by an Adobe segment.
+- DQT, DHT, SOS, DRI and restart markers, byte stuffing and fill bytes; APPn
+  and COM segments are skipped.
+- Huffman decoding through a 16-bit lookup table, zigzag undone, the inverse
+  DCT, libjpeg's "fancy" chroma upsampling (3/4 of the nearer sample, 1/4 of
+  the next), and the JFIF equations back to RGB, clamped to 0..255.
+- Everything in the file is checked before it is used. A broken file, or a
+  progressive, arithmetic coded, lossless or 12-bit one, raises `ValueError`
+  with the reason.
 
 ## How it compares
 
@@ -80,17 +94,41 @@ to 2.81) than between the two.
 It is slow, being pure Python: 1.9 seconds for the render at 4:2:0 and 3.2 at
 4:4:4, median of five in one process.
 
+### Reading
+
+The decoder is tested on files Pillow wrote (and a few of this encoder's, but
+never only those), and its pixels are compared with Pillow's own decoding of
+each. They are never more than 3 levels
+apart, because libjpeg rounds its inverse DCT, upsampling and colour
+conversion in integers. On the render at quality 75:
+
+| Pillow's file | values equal to Pillow's | largest difference | PSNR between the two |
+| --- | --- | --- | --- |
+| greyscale | 99.38% | 1 | 70.24 dB |
+| 4:4:4 | 99.11% | 3 | 67.49 dB |
+| 4:2:2 | 91.50% | 3 | 58.69 dB |
+| 4:2:0 | 86.71% | 3 | 56.77 dB |
+
+Over all 131 files in the test (127 of them Pillow's, 4 this encoder's) the
+lowest is 51.90 dB, and a flat colour at 4:4:4 comes out exactly equal. Restart markers, `optimize=True`, odd sizes and
+`keep_rgb=True` are among them. Decoding the render takes 1.27 seconds at
+4:2:0, against about 1.2 milliseconds for Pillow.
+
 ## Running it
 
     python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--optimize]
+    python jpeg.py -d IN.jpg [-o OUT.png]
     python test_jpeg.py
 
 `--optimize` builds Huffman tables for the picture instead of using the
-standard ones: smaller files, the same pixels. Pillow reads the PNG on the command line. Everything after the pixels, the
-whole JPEG, is this file and the standard library.
+standard ones: smaller files, the same pixels. `-d` decodes a JPEG and writes
+a PNG. Pillow reads or writes the PNG on the command line; the whole JPEG, both
+ways, is this file and the standard library. `python test_jpeg.py` took about a
+minute here (60 to 63 seconds).
 
 ## Notes
 
 [DOCS.md](DOCS.md) is what writing it taught me, including why a flat colour
-can come back worse at quality 50 than at 25, and the 44 ways I broke the code
-on purpose to see whether the tests noticed.
+can come back worse at quality 50 than at 25, why the decoder's pixels differ
+from Pillow's, and the 75 ways I broke the code on purpose to see whether the
+tests noticed.
