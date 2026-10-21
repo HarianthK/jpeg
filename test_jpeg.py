@@ -523,5 +523,22 @@ finally:
             os.remove(name)
 print("the decoder reads what Pillow writes")
 
+# Greyscale: one component, which Pillow must read as an L picture of the right size, about as close
+# to the brightness of the original as Pillow's own greyscale file is, and no bigger.
+render = Image.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "trace-rays", "render.png")).convert("RGB")
+grey_src = render.convert("L").tobytes()
+for opt in (False, True):
+    ours = jpeg.encode(render.tobytes(), render.width, render.height, 75, optimize=opt, grey=True)
+    back = Image.open(io.BytesIO(ours))
+    back.load()
+    buf = io.BytesIO()
+    render.convert("L").save(buf, "JPEG", quality=75, optimize=opt)
+    theirs = Image.open(io.BytesIO(buf.getvalue()))
+    check(back.mode == "L" and back.size == render.size, f"grey (optimize {opt}): Pillow read {back.mode} {back.size}")
+    close = psnr(back.tobytes(), grey_src) >= psnr(theirs.convert("L").tobytes(), grey_src) - 0.3
+    check(close and len(ours) <= len(buf.getvalue()),
+          f"grey (optimize {opt}): {len(ours)} bytes at {psnr(back.tobytes(), grey_src):.2f} dB against Pillow's {len(buf.getvalue())}")
+print("greyscale files are read by Pillow as one channel, as small as Pillow's own")
+
 print("FAILURES" if failures else "ok")
 sys.exit(1 if failures else 0)

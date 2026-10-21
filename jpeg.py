@@ -1,5 +1,5 @@
 # Writes and reads baseline JPEGs: YCbCr, 8x8 DCT, quantization, zigzag, then Huffman coding.
-# Run: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--optimize], or -d IN.jpg [-o OUT.png]
+# Run: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize], or -d IN.jpg [-o OUT.png]
 import math
 import struct
 import sys
@@ -224,13 +224,14 @@ def segment(marker, body):
     return struct.pack(">HH", marker, len(body) + 2) + body
 
 
-def encode(rgb, width, height, quality=75, subsample=True, optimize=False):
+def encode(rgb, width, height, quality=75, subsample=True, optimize=False, grey=False):
     # rgb is width * height * 3 bytes, row by row. Returns the bytes of a JFIF file.
     # optimize counts this picture's symbols first and builds its own Huffman tables from them.
     if not (0 < width < 65536 and 0 < height < 65536) or len(rgb) != width * height * 3:
         raise ValueError("rgb must be width * height * 3 bytes, each side 1 to 65535")
     luma_q, chroma_q = quant_tables(quality)
-    mcu = 16 if subsample else 8
+    # grey keeps only the brightness channel: one block per MCU, one component in the file.
+    mcu = 16 if subsample and not grey else 8
     y_plane, cb, cr = planes(rgb, width, height, mcu)
     if subsample:
         cb, cr = halve(cb), halve(cr)
@@ -245,16 +246,17 @@ def encode(rgb, width, height, quality=75, subsample=True, optimize=False):
             for dy in range(0, mcu, 8):
                 for dx in range(0, mcu, 8):
                     blocks.append((0, coefficients(block(y_plane, mx + dx, my + dy), luma_q)))
-            cx, cy = (mx // 2, my // 2) if subsample else (mx, my)
-            blocks.append((1, coefficients(block(cb, cx, cy), chroma_q)))
-            blocks.append((2, coefficients(block(cr, cx, cy), chroma_q)))
+            if not grey:
+                cx, cy = (mx // 2, my // 2) if subsample else (mx, my)
+                blocks.append((1, coefficients(block(cb, cx, cy), chroma_q)))
+                blocks.append((2, coefficients(block(cr, cx, cy), chroma_q)))
 
-    def code(w, dc_l, ac_l, dc_c, ac_c):
+    def code(w, dc_l, ac_l, dc_c=None, ac_c=None):
         prev = [0, 0, 0]
         for c, zz in blocks:
             prev[c] = encode_block(w, zz, prev[c], *((dc_l, ac_l) if c == 0 else (dc_c, ac_c)))
 
-    tables = (DC_LUMA, AC_LUMA, DC_CHROMA, AC_CHROMA)
+    tables = (DC_LUMA, AC_LUMA) if grey else (DC_LUMA, AC_LUMA, DC_CHROMA, AC_CHROMA)
     if optimize:
         tallies = [Tally() for _ in tables]
         code(types.SimpleNamespace(write=lambda value, n: None), *tallies)
@@ -264,14 +266,22 @@ def encode(rgb, width, height, quality=75, subsample=True, optimize=False):
     w.flush()
 
     luma_sampling = 0x22 if subsample else 0x11
+    dqt = b"\x00" + bytes(luma_q[z] for z in ZIGZAG)
+    if grey:
+        sof = struct.pack(">BHHB", 8, height, width, 1) + bytes([1, 0x11, 0])
+        sos = bytes([1, 1, 0x00, 0, 63, 0])
+    else:
+        dqt += b"\x01" + bytes(chroma_q[z] for z in ZIGZAG)
+        sof = struct.pack(">BHHB", 8, height, width, 3) + bytes([1, luma_sampling, 0, 2, 0x11, 1, 3, 0x11, 1])
+        sos = bytes([3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0])
     return b"".join([
         b"\xff\xd8",
         segment(0xFFE0, b"JFIF\0\x01\x01\x00" + struct.pack(">HHBB", 1, 1, 0, 0)),
-        segment(0xFFDB, b"\x00" + bytes(luma_q[z] for z in ZIGZAG) + b"\x01" + bytes(chroma_q[z] for z in ZIGZAG)),
-        segment(0xFFC0, struct.pack(">BHHB", 8, height, width, 3) + bytes([1, luma_sampling, 0, 2, 0x11, 1, 3, 0x11, 1])),
+        segment(0xFFDB, dqt),
+        segment(0xFFC0, sof),
         segment(0xFFC4, b"".join(bytes([tc_th]) + bytes(t[0]) + t[1] for tc_th, t in
                                  zip((0x00, 0x10, 0x01, 0x11), tables))),
-        segment(0xFFDA, bytes([3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0])),
+        segment(0xFFDA, sos),
         bytes(w.out),
         b"\xff\xd9",
     ])
@@ -555,7 +565,7 @@ if __name__ == "__main__":
     argv = sys.argv[1:]
     args = [a for i, a in enumerate(argv) if not a.startswith("-") and (i == 0 or argv[i - 1] not in ("-o", "-q"))]
     if not args:
-        sys.exit("usage: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--optimize]\n"
+        sys.exit("usage: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize]\n"
                  "       python jpeg.py -d IN.jpg [-o OUT.png]")
     from PIL import Image  # only to read or write the PNG; the JPEG is all this file
     source = args[0]
@@ -573,7 +583,7 @@ if __name__ == "__main__":
     quality = int(argv[argv.index("-q") + 1]) if "-q" in argv else 75
     image = Image.open(source).convert("RGB")
     packed = encode(image.tobytes(), image.width, image.height, quality, subsample="--444" not in argv,
-                    optimize="--optimize" in argv)
+                    optimize="--optimize" in argv, grey="--grey" in argv)
     open(out, "wb").write(packed)
     raw = image.width * image.height * 3
     print(f"{source}: {image.width}x{image.height}, {raw} bytes of pixels -> {len(packed)} bytes "

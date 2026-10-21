@@ -116,7 +116,7 @@ lowest is 51.90 dB, and a flat colour at 4:4:4 comes out exactly equal. Restart 
 
 ## Running it
 
-    python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--optimize]
+    python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize]
     python jpeg.py -d IN.jpg [-o OUT.png]
     python test_jpeg.py
 
