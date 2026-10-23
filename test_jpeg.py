@@ -540,5 +540,20 @@ for opt in (False, True):
           f"grey (optimize {opt}): {len(ours)} bytes at {psnr(back.tobytes(), grey_src):.2f} dB against Pillow's {len(buf.getvalue())}")
 print("greyscale files are read by Pillow as one channel, as small as Pillow's own")
 
+# Restart markers change how the bits are framed, never the pixels: Pillow and our decoder must
+# read exactly what they read without them, and RST0 to RST7 must come round in order.
+image = IMAGES["gradient 33x21"]
+for opts in ({}, {"subsample": False}, {"grey": True}, {"optimize": True}):
+    plain = jpeg.encode(image.tobytes(), image.width, image.height, **opts)
+    for every in (1, 2, 5):
+        marked = jpeg.encode(image.tobytes(), image.width, image.height, restart=every, **opts)
+        found = [marked[i + 1] - 0xD0 for i in range(len(marked) - 1) if marked[i] == 0xFF and 0xD0 <= marked[i + 1] <= 0xD7]
+        side = 16 if opts.get("subsample", True) and not opts.get("grey") else 8
+        mcus = -(-image.width // side) * -(-image.height // side)
+        check(found == [i % 8 for i in range((mcus - 1) // every)], f"restart {every} {opts}: markers {found}")
+        check(Image.open(io.BytesIO(marked)).tobytes() == Image.open(io.BytesIO(plain)).tobytes(), f"restart {every} {opts}: Pillow read other pixels")
+        check(our_decode(marked, "restart") == our_decode(plain, "plain"), f"restart {every} {opts}: our decoder read other pixels")
+print("restart markers come in order and leave every pixel as it was")
+
 print("FAILURES" if failures else "ok")
 sys.exit(1 if failures else 0)

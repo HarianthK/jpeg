@@ -224,9 +224,11 @@ def segment(marker, body):
     return struct.pack(">HH", marker, len(body) + 2) + body
 
 
-def encode(rgb, width, height, quality=75, subsample=True, optimize=False, grey=False):
+def encode(rgb, width, height, quality=75, subsample=True, optimize=False, grey=False, restart=0):
     # rgb is width * height * 3 bytes, row by row. Returns the bytes of a JFIF file.
     # optimize counts this picture's symbols first and builds its own Huffman tables from them.
+    if not 0 <= restart < 65536:
+        raise ValueError("restart is 0 to 65535 MCUs")
     if not (0 < width < 65536 and 0 < height < 65536) or len(rgb) != width * height * 3:
         raise ValueError("rgb must be width * height * 3 bytes, each side 1 to 65535")
     luma_q, chroma_q = quant_tables(quality)
@@ -251,15 +253,23 @@ def encode(rgb, width, height, quality=75, subsample=True, optimize=False, grey=
                 blocks.append((1, coefficients(block(cb, cx, cy), chroma_q)))
                 blocks.append((2, coefficients(block(cr, cx, cy), chroma_q)))
 
+    # restart: every that many MCUs, end the byte, write RST0 to RST7 in turn and start DC from zero,
+    # so a damaged byte spoils only up to the next marker.
+    per_mcu = (mcu // 8) ** 2 + (0 if grey else 2)
+
     def code(w, dc_l, ac_l, dc_c=None, ac_c=None):
         prev = [0, 0, 0]
-        for c, zz in blocks:
+        for i, (c, zz) in enumerate(blocks):
+            if restart and i and i % (per_mcu * restart) == 0:
+                w.flush()
+                w.out += bytes([0xFF, 0xD0 + (i // (per_mcu * restart) - 1) % 8])
+                prev = [0, 0, 0]
             prev[c] = encode_block(w, zz, prev[c], *((dc_l, ac_l) if c == 0 else (dc_c, ac_c)))
 
     tables = (DC_LUMA, AC_LUMA) if grey else (DC_LUMA, AC_LUMA, DC_CHROMA, AC_CHROMA)
     if optimize:
         tallies = [Tally() for _ in tables]
-        code(types.SimpleNamespace(write=lambda value, n: None), *tallies)
+        code(types.SimpleNamespace(write=lambda value, n: None, flush=lambda: None, out=bytearray()), *tallies)
         tables = [build_table(t.counts) for t in tallies]
     w = BitWriter()
     code(w, *(huffman_codes(t) for t in tables))
@@ -281,6 +291,7 @@ def encode(rgb, width, height, quality=75, subsample=True, optimize=False, grey=
         segment(0xFFC0, sof),
         segment(0xFFC4, b"".join(bytes([tc_th]) + bytes(t[0]) + t[1] for tc_th, t in
                                  zip((0x00, 0x10, 0x01, 0x11), tables))),
+        segment(0xFFDD, struct.pack(">H", restart)) if restart else b"",
         segment(0xFFDA, sos),
         bytes(w.out),
         b"\xff\xd9",
@@ -563,9 +574,9 @@ def decode(data):
 
 if __name__ == "__main__":
     argv = sys.argv[1:]
-    args = [a for i, a in enumerate(argv) if not a.startswith("-") and (i == 0 or argv[i - 1] not in ("-o", "-q"))]
+    args = [a for i, a in enumerate(argv) if not a.startswith("-") and (i == 0 or argv[i - 1] not in ("-o", "-q", "--restart"))]
     if not args:
-        sys.exit("usage: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize]\n"
+        sys.exit("usage: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize] [--restart N]\n"
                  "       python jpeg.py -d IN.jpg [-o OUT.png]")
     from PIL import Image  # only to read or write the PNG; the JPEG is all this file
     source = args[0]
@@ -583,7 +594,8 @@ if __name__ == "__main__":
     quality = int(argv[argv.index("-q") + 1]) if "-q" in argv else 75
     image = Image.open(source).convert("RGB")
     packed = encode(image.tobytes(), image.width, image.height, quality, subsample="--444" not in argv,
-                    optimize="--optimize" in argv, grey="--grey" in argv)
+                    optimize="--optimize" in argv, grey="--grey" in argv,
+                    restart=int(argv[argv.index("--restart") + 1]) if "--restart" in argv else 0)
     open(out, "wb").write(packed)
     raw = image.width * image.height * 3
     print(f"{source}: {image.width}x{image.height}, {raw} bytes of pixels -> {len(packed)} bytes "
