@@ -349,7 +349,7 @@ readings = []
 def against_pillow(data, where, worst=3):
     # Per channel, the largest difference from Pillow's decoding, and the PSNR between the two.
     # The floors sit about a decibel under the lowest I measured; upsampling costs the most.
-    floor = 51 if "4:2:" in where else 57
+    floor = 51 if "4:2:" in where or "4:4:0" in where else 57
     got = our_decode(data, where)
     if got is None:
         return
@@ -454,7 +454,6 @@ refused(bytes(patched), "frame uses quantization table 3, never defined", "never
 refused(pillow_jpeg(IMAGES["noise 17x9"], quality=75, streamtype=2), "Pillow's abbreviated file, no tables", "never defined")
 # Ones from the first scan byte on: longer than any DC luma code in Annex K, so it matches nothing.
 refused(small[:scan_start] + b"\xff\x00" * 4 + small[scan_start + 8:], "a code that matches nothing", "matches nothing")
-refused(pillow_jpeg(IMAGES["noise 17x9"], quality=75, progressive=True), "Pillow's progressive file", "progressive")
 for marker, words in ((0xC9, "arithmetic"), (0xC3, "lossless"), (0xC2, "progressive"), (0xC1, "extended")):
     patched = bytearray(small)
     patched[at[0xC0] + 1] = marker
@@ -554,6 +553,87 @@ for opts in ({}, {"subsample": False}, {"grey": True}, {"optimize": True}):
         check(Image.open(io.BytesIO(marked)).tobytes() == Image.open(io.BytesIO(plain)).tobytes(), f"restart {every} {opts}: Pillow read other pixels")
         check(our_decode(marked, "restart") == our_decode(plain, "plain"), f"restart {every} {opts}: our decoder read other pixels")
 print("restart markers come in order and leave every pixel as it was")
+
+# Progressive and multi-scan files. jpegtran rewrites the scans without touching a coefficient, so
+# each file in scans/ must decode to exactly the pixels of the baseline file it was made from.
+SCANS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scans")
+for name in sorted(os.listdir(SCANS)):
+    if name.endswith(".jpg") and "_" in name:
+        source = name.split("_")[0] + ".jpg"
+        ours = our_decode(open(os.path.join(SCANS, name), "rb").read(), name)
+        check(ours is not None and ours == our_decode(open(os.path.join(SCANS, source), "rb").read(), source),
+              f"{name} decoded to other pixels than {source}")
+# Pillow's progressive files are separate encodes, so they are held to libjpeg's reading instead.
+for label in ("gradient 33x21", "noise 17x9", "flat colour 40x24"):
+    for sub, kind in ((0, "4:4:4"), (1, "4:2:2"), (2, "4:2:0")):
+        against_pillow(pillow_jpeg(IMAGES[label], quality=75, subsampling=sub, progressive=True), f"{label}, q75, {kind}, progressive")
+    against_pillow(pillow_jpeg(IMAGES[label].convert("L"), quality=75, progressive=True), f"{label}, q75, greyscale, progressive", worst=1)
+# 4:4:0 (luma 1x2): Pillow cannot write it, so this is a 4:2:2 file turned with jpegtran -transpose.
+against_pillow(open(os.path.join(SCANS, "440.jpg"), "rb").read(), "jpegtran's 29x37, 4:4:0")
+against_pillow(pillow_jpeg(IMAGES["gradient 33x21"], quality=90, progressive=True, optimize=True, restart_marker_blocks=2),
+               "gradient 33x21, q90, 4:2:0, progressive, optimized, restarts")
+print("progressive and per-component files decode exactly as their baseline sources, and as libjpeg reads Pillow's")
+
+
+def scans_in(data):
+    # (start of each SOS segment, start of the marker after its coded data).
+    found, pos = [], 2
+    while data[pos + 1] != 0xD9:
+        n = int.from_bytes(data[pos + 2:pos + 4], "big")
+        if data[pos + 1] != 0xDA:
+            pos += 2 + n
+            continue
+        end = pos + 2 + n
+        while not (data[end] == 0xFF and data[end + 1] not in (0, *range(0xD0, 0xD8))):
+            end += 1
+        found.append((pos, end))
+        pos = end
+    return found
+
+
+prog = open(os.path.join(SCANS, "420_successive.jpg"), "rb").read()
+sos = scans_in(prog)[0][0]
+header_end = sos + 2 + int.from_bytes(prog[sos + 2:sos + 4], "big")
+patched = bytearray(prog)
+patched[header_end - 2] = 5  # the DC scan's Se: a band from 0 to 5 mixes DC and AC
+refused(bytes(patched), "a progressive scan from 0 to 5", "not valid")
+patched[header_end - 2], patched[header_end - 1] = 0, 0x0E
+refused(bytes(patched), "a progressive scan with Al = 14", "not valid")
+split = open(os.path.join(SCANS, "420_per_component.jpg"), "rb").read()
+spans = scans_in(split)
+refused(split[:spans[-1][0]] + b"\xff\xd9", "a per-component file missing its last scan", "in no scan")
+refused(split[:spans[0][1]] + split[spans[0][0]:], "a baseline component scanned twice", "two baseline scans")
+# One end-of-band symbol can stand for 32,767 blocks, so blocks are only made when a scan reaches
+# them. A header grown to 60000x60000 runs out of bits in the DC scan instead of asking for memory.
+plain = open(os.path.join(SCANS, "420_progressive.jpg"), "rb").read()
+sof = plain.index(b"\xff\xc2")
+refused(plain[:sof + 5] + b"\xea\x60\xea\x60" + plain[sof + 9:], "a progressive header claiming 60000x60000")
+# A flat picture's AC scans are all end-of-band runs, so without its DC scans (Ss = 0, the byte
+# three from the end of the SOS header) no scan reaches any block.
+flat = pillow_jpeg(IMAGES["flat colour 40x24"], quality=75, progressive=True)
+spans = scans_in(flat)
+ss_of = lambda a: flat[a + 2 + int.from_bytes(flat[a + 2:a + 4], "big") - 3]
+ac_only = flat
+for a, b in reversed(spans):
+    if not ss_of(a):
+        ac_only = ac_only[:a] + ac_only[b:]
+refused(ac_only, "a progressive file without its DC scans", "never reach")
+for n in range(0, len(prog), 7):
+    refused(prog[:n], f"progressive file cut to {n} of {len(prog)} bytes")
+fuzz, decoded = random.Random(12), 0
+for n in range(200):
+    broken = bytearray(prog)
+    for _ in range(fuzz.choice((1, 2, 4))):
+        broken[fuzz.randrange(2, len(broken))] ^= 1 << fuzz.randrange(8)
+    try:
+        width, height, rgb = jpeg.decode(bytes(broken))
+        check(len(rgb) == 3 * width * height, f"progressive flip {n}: {width}x{height} but {len(rgb)} bytes")
+        decoded += 1
+    except ValueError:
+        pass
+    except Exception as e:
+        check(False, f"progressive flip {n}: raised {e!r}")
+print(f"broken progressive scans refused; 200 bit-flipped files: {decoded} decoded, the rest refused with ValueError")
 
 print("FAILURES" if failures else "ok")
 sys.exit(1 if failures else 0)

@@ -383,16 +383,16 @@ each of its 148 bytes with the EOI put back, and 300 seeded random bit flips
 across two files. Of the flips, 191 still decode to a picture of the right
 size and every other one is refused with `ValueError`, never anything else.
 
-A file can also be valid and simply not baseline. Progressive, arithmetic
+A file can also be valid and simply not something this reads. Arithmetic
 coded, lossless, hierarchical, extended (SOF1) and 12-bit files are refused by
-name, for example "progressive (SOF2) JPEGs are not supported, only baseline
-(SOF0)". The test checks that wording on Pillow's own `progressive=True`
-file, and on a real file with its SOF0 marker or precision byte changed.
+name, for example "lossless (SOF3) JPEGs are not supported, only baseline
+(SOF0) and progressive (SOF2)". The test checks that wording on a real file
+with its SOF0 marker or precision byte changed.
 
 Sizes in the header are not trusted either. One flipped bit can turn a width of
-17 into 32,785, so the sample rows are made one MCU row at
-a time as the data arrives, and a header that promises more than the data
-holds runs out of bits before it has cost much memory.
+17 into 32,785, so a block is only made when a scan's data reaches it, and a
+header that promises more than the data holds runs out of bits before it has
+cost much memory. Progressive files make this harder, see below.
 
 ### Running out of bits, and a misleading message
 
@@ -422,6 +422,71 @@ writes 919 of them, one between each pair of its 920 MCUs. With the DC
 prediction carried across a marker, the render came back at 8.65 dB against
 Pillow's decoding, and only the restart files failed. A marker may have extra
 0xFF fill bytes in front of it, and the test puts two before RST1.
+
+### Progressive files
+
+A progressive file sends the same quantized coefficients as a baseline one,
+in several passes instead of block by block, so a viewer can show a blurry
+picture early and sharpen it. Each scan (Annex G) covers a band of zigzag
+positions, Ss to Se, at a precision: Al is how many low bits are still left
+out, and Ah is how many the previous pass left out, 0 on a first pass. Four
+kinds of scan follow from that:
+
+- DC first (Ss = Se = 0, Ah = 0): the DC differences as in baseline, shifted
+  up by Al. It may interleave all components.
+- DC refinement (Ss = 0, Ah > 0): one raw bit per block, the next DC bit down.
+- AC first (Ss > 0, Ah = 0): the band's (zeros, size) pairs, shifted by Al,
+  one component per scan. An end-of-band code carries a count, 2^r plus r more
+  bits, of blocks in a row that have nothing in this band, so one symbol can
+  stand for up to 32,767 blocks.
+- AC refinement (Ss > 0, Ah > 0): the hard one. Every coefficient already
+  non-zero gets one correction bit, which moves it one step of 2^Al away from
+  zero. Coefficients that become non-zero only at this precision are sent as
+  a run and a sign, and the run counts only the zeros, skipping over (and
+  correcting) the non-zero ones on the way. Inside an end-of-band run the
+  known coefficients still get their correction bits.
+
+So the decoder no longer turns a scan straight into pixels. Every scan writes
+into a store of quantized coefficients per component, in zigzag order, and
+only after EOI is each block dequantized, inverse transformed and laid into
+its plane. Baseline files go the same way, which also lets them send one
+scan per component (each read block by block over the component's own size,
+not whole MCUs), something the old decoder refused. The quantization table
+is taken when a component is first seen, as libjpeg does.
+
+The memory rule above needed rethinking. A progressive header can ask for
+60000x60000 pixels, and its AC scans can then cover the whole picture with a
+few end-of-band symbols, never paying a bit per block. So blocks are made only
+when a scan writes to one (an unseen block inside an end-of-band run is read
+as zeros and left unmade), and at the end every block of each component must
+have been reached. A real file always does that, since its DC scan codes every
+block with at least one bit, so a header that promises more than the data
+holds runs out of bits instead. The test pins both halves: the 60000x60000
+header is refused, and a flat picture's file without its DC scans, whose AC
+scans are nothing but end-of-band runs, is refused with "the scans never
+reach every block". Making blocks inside end-of-band runs, or dropping the
+reach check, lets that file decode.
+
+The strongest test is lossless. `jpegtran` rewrites the scans of a file
+without touching a coefficient, so every rewritten file must decode to
+exactly the bytes of the baseline file it came from, with no tolerance at
+all. `scans/` holds a 37x29 picture at 4:2:0 and 4:4:4 and greyscale, each
+rewritten with jpegtran's own progressive script (with restart markers every
+block too), one baseline scan per component (`per_component.txt`), spectral
+selection only (`spectral.txt`), and a deeper script of successive
+approximation with three DC passes, two AC bands and refinements down to
+Al = 0, with a restart every two blocks (`successive.txt`). The files are made
+with, for example, `jpegtran -scans scans/successive.txt -restart 2B -outfile
+scans/420_successive.jpg scans/420.jpg`, so the test needs no jpegtran itself.
+Pillow's own `progressive=True` files are separate encodes, so those are held
+to Pillow's reading within 3 levels, as every other file is. The first
+version passed the lossless files on its first run; three breakages (a
+refinement bit that ignores the sign, an end-of-band run one block too long,
+DC refinement dropped) each fail them.
+
+Reading every scan into a store first costs baseline files a little: 1.11
+seconds against 1.01 for the render at quality 75, medians of five runs
+alternating the old and new decoder in one process.
 
 ### Why it differs from Pillow by a few levels
 
@@ -498,7 +563,11 @@ run against it:
 | DRI ignored | every restart file refused |
 | SOI not checked | missing SOI (by its message) |
 | unknown markers skipped | unknown marker 0xFFF7 |
-| SOF2 read as SOF0, spectral check removed | Pillow's progressive file; SOF0 marked SOF2 decoded |
+| refinement bit that ignores the sign | the lossless progressive files |
+| end-of-band run one block too long | the lossless progressive files |
+| DC refinement bit dropped | the lossless progressive files |
+| blocks made inside end-of-band runs | a flat picture without its DC scans |
+| check that the scans reach every block removed | a flat picture without its DC scans |
 | precision not checked | 12-bit precision decoded |
 | a lone component keeps its 2x2 factors | greyscale marked 2x2 against Pillow and against itself |
 | chroma size rounded down, not up | 17x9 and 33x21 at 4:2:2 and 4:2:0 |
@@ -527,10 +596,8 @@ not only at the exception type.
 
 ## What it does not do
 
-The encoder writes no progressive files, no restart markers, no greyscale
-files and no EXIF. The decoder refuses progressive, arithmetic coded,
-lossless, hierarchical, extended (SOF1) and 12-bit files, files with one scan
-per component, sampling other than 1x or 2x the chroma (4:1:1), and four
-components (CMYK). It ignores EXIF orientation and ICC profiles. A file with
+The encoder writes no progressive files and no EXIF. The decoder refuses
+arithmetic coded, lossless, hierarchical, extended (SOF1) and 12-bit files,
+sampling other than 1x or 2x the chroma (4:1:1), and four components (CMYK). It ignores EXIF orientation and ICC profiles. A file with
 no JFIF or Adobe segment and components named R, G and B is read as YCbCr,
 where libjpeg would read it as RGB.

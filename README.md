@@ -1,8 +1,8 @@
 # jpeg
 
-A baseline JPEG encoder and decoder written from the bits up, in one Python
-file with no dependencies. It writes real `.jpg` files that any viewer opens,
-and reads baseline files other programs wrote.
+A JPEG encoder and decoder written from the bits up, in one Python file with
+no dependencies. It writes real baseline `.jpg` files that any viewer opens,
+and reads the baseline and progressive files other programs wrote.
 
     $ python jpeg.py ../trace-rays/render.png -o render.jpg
     ../trace-rays/render.png: 640x360, 691200 bytes of pixels -> 18254 bytes (37.9 to 1), quality 75, 4:2:0
@@ -38,16 +38,19 @@ Huffman coded.
 
 Reading, with `decode(data)` or `-d`:
 
-- Baseline sequential files (SOF0), 8-bit, greyscale or YCbCr at 4:4:4, 4:2:2
-  or 4:2:0, and RGB files marked by an Adobe segment.
+- Baseline sequential files (SOF0) and progressive ones (SOF2), 8-bit,
+  greyscale or YCbCr at 4:4:4, 4:2:2, 4:2:0 or 4:4:0, and RGB files marked by
+  an Adobe segment. A file may send its components in one scan or one each.
+- Progressive scans of every kind: DC and AC bands, end-of-band runs, and the
+  refinement scans that add one more bit of precision at a time.
 - DQT, DHT, SOS, DRI and restart markers, byte stuffing and fill bytes; APPn
   and COM segments are skipped.
 - Huffman decoding through a 16-bit lookup table, zigzag undone, the inverse
   DCT, libjpeg's "fancy" chroma upsampling (3/4 of the nearer sample, 1/4 of
   the next), and the JFIF equations back to RGB, clamped to 0..255.
-- Everything in the file is checked before it is used. A broken file, or a
-  progressive, arithmetic coded, lossless or 12-bit one, raises `ValueError`
-  with the reason.
+- Everything in the file is checked before it is used. A broken file, or an
+  arithmetic coded, lossless or 12-bit one, raises `ValueError` with the
+  reason.
 
 ## How it compares
 

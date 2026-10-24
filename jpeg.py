@@ -299,7 +299,7 @@ def encode(rgb, width, height, quality=75, subsample=True, optimize=False, grey=
 
 
 # Reading. Everything from here on trusts nothing in the file; see DOCS.md.
-REFUSED = {0xC1: "extended sequential (SOF1)", 0xC2: "progressive (SOF2)", 0xC3: "lossless (SOF3)",
+REFUSED = {0xC1: "extended sequential (SOF1)", 0xC3: "lossless (SOF3)",
            0xC9: "arithmetic coded (SOF9)", 0xCA: "progressive arithmetic coded (SOF10)",
            0xCB: "lossless arithmetic coded (SOF11)", 0xCC: "arithmetic coded (DAC)", 0xDC: "DNL marker"}
 REFUSED.update({m: f"hierarchical (marker 0xFF{m:02X})" for m in (0xC5, 0xC6, 0xC7, 0xCD, 0xCE, 0xCF, 0xDE, 0xDF)})
@@ -343,9 +343,9 @@ def read_tables(marker, body, qt, huff):
 
 
 def read_frame(body):
-    # SOF0: precision, height, width, then (id, sampling, table) per component.
+    # SOF0 or SOF2: precision, height, width, then (id, sampling, table) per component.
     if len(body) < 6:
-        raise ValueError("the SOF0 segment is cut short")
+        raise ValueError("the frame header (SOF) is cut short")
     precision, height, width, n = struct.unpack(">BHHB", body[:6])
     if precision != 8:
         raise ValueError(f"{precision}-bit samples are not supported, only 8-bit")
@@ -395,8 +395,25 @@ def idct(coef):
     return [min(max(int(sum(c[y] * m[x] for c, m in g) + 128.5), 0), 255) for y in range(8) for x in range(8)]
 
 
-def read_block(bits, pos, dc, ac, q):
-    # One block: the DC difference, then (zeros, size) pairs to EOB, dequantized into natural order.
+def symbol_at(bits, pos, table):
+    entry = table[int(bits[pos:pos + 16], 2)]
+    if entry is None:
+        raise ValueError("a Huffman code in the scan data matches nothing in its table")
+    return entry[0], pos + entry[1]
+
+
+def received(bits, pos, size, most):
+    # The next size bits as a signed value (EXTEND in F.2.2.1); most is what 8-bit samples allow.
+    if size > most:
+        raise ValueError("a coefficient is bigger than 8-bit baseline allows")
+    value = int(bits[pos:pos + size], 2) if size else 0
+    if size and value < 1 << (size - 1):
+        value -= (1 << size) - 1
+    return value, pos + size
+
+
+def read_block(bits, pos, dc, ac):
+    # One baseline block: the DC difference, then (zeros, size) pairs to EOB, in zigzag order.
     coef = [0] * 64
     k = 0
     while k < 64:
@@ -425,16 +442,97 @@ def read_block(bits, pos, dc, ac, q):
     return pos, coef
 
 
-def read_scan(data, pos, body, frame, qt, huff, interval):
-    # Decodes the one interleaved scan into a plane of samples per component, padded to whole MCUs.
+def ac_first(bits, pos, ac, blk, ss, se, al, eobrun):
+    # The first pass over a band: like a baseline block's AC part, scaled up by Al, except that an
+    # end-of-band can stand for a whole run of blocks with nothing in this band (G.1.2.2).
+    if eobrun:
+        return pos, eobrun - 1
+    k = ss
+    while k <= se:
+        symbol, pos = symbol_at(bits, pos, ac)
+        run, size = symbol >> 4, symbol & 15
+        if not size:
+            if run == 15:
+                k += 16
+                continue
+            # 2^run blocks end here, this one included, plus run more bits of count.
+            eobrun = (1 << run) - 1 + (int(bits[pos:pos + run], 2) if run else 0)
+            return pos + run, eobrun
+        k += run
+        if k > se:
+            raise ValueError("a block has more coefficients than its scan's band holds")
+        blk[k], pos = received(bits, pos, size, 10)
+        blk[k] <<= al
+        k += 1
+    return pos, 0
+
+
+def ac_refine(bits, pos, ac, blk, ss, se, al, eobrun):
+    # A later pass sends one more bit of each coefficient already known, and places coefficients
+    # that only now become 1 or -1 at this precision, counting runs in zeros alone (G.1.2.3).
+    p1, m1 = 1 << al, -1 << al
+    k = ss
+    if not eobrun:
+        while k <= se:
+            symbol, pos = symbol_at(bits, pos, ac)
+            run, size, value = symbol >> 4, symbol & 15, 0
+            if size:
+                if size != 1:
+                    raise ValueError("a refinement scan sent a new coefficient of more than one bit")
+                value = p1 if bits[pos] == "1" else m1
+                pos += 1
+            elif run != 15:
+                eobrun = (1 << run) + (int(bits[pos:pos + run], 2) if run else 0)
+                pos += run
+                break
+            while k <= se:
+                if blk[k]:
+                    if bits[pos] == "1" and not blk[k] & p1:
+                        blk[k] += p1 if blk[k] >= 0 else m1
+                    pos += 1
+                elif run:
+                    run -= 1
+                else:
+                    break
+                k += 1
+            if value:
+                if k > se:
+                    raise ValueError("a block has more coefficients than its scan's band holds")
+                blk[k] = value
+            k += 1
+    if eobrun:
+        # Inside an end-of-band run only the known coefficients get their bit.
+        for k in range(k, se + 1):
+            if blk[k]:
+                if bits[pos] == "1" and not blk[k] & p1:
+                    blk[k] += p1 if blk[k] >= 0 else m1
+                pos += 1
+        eobrun -= 1
+    return pos, eobrun
+
+
+def own_blocks(c, width, height, hmax, vmax):
+    # How many blocks across and down a component's own samples cover, before MCU padding.
+    return -(-(-(-width * c["h"] // hmax)) // 8), -(-(-(-height * c["v"] // vmax)) // 8)
+
+
+ZEROS = (0,) * 64
+
+
+def read_scan(data, pos, body, frame, qt, huff, interval, coefs, progressive):
+    # Decodes one scan into coefs (per component: its quantization table and blocks, zigzag order)
+    # and returns where the next marker starts. DOCS.md, "Progressive files", has the four kinds.
     width, height, comps = frame
     ns = body[0] if body else 0
     if not ns or len(body) != 4 + 2 * ns:
         raise ValueError("the SOS segment has the wrong length")
-    if tuple(body[-3:]) != (0, 63, 0):
-        raise ValueError("a scan of part of the spectrum (progressive) is not supported")
-    if ns != len(comps):
-        raise ValueError("scans that do not hold every component are not supported")
+    ss, se, ah, al = body[-3], body[-2], body[-1] >> 4, body[-1] & 15
+    if not progressive and (ss, se, ah, al) != (0, 63, 0, 0):
+        raise ValueError("a baseline scan must hold all 64 coefficients at full precision")
+    if progressive and (se > 63 or ss > se or (ss == 0) != (se == 0) or (ss and ns != 1) or ah > 13 or al > 13):
+        raise ValueError(f"a progressive scan with Ss={ss} Se={se} Ah={ah} Al={al} is not valid")
+    hmax, vmax = max(c["h"] for c in comps), max(c["v"] for c in comps)
+    mcux, mcuy = -(-width // (8 * hmax)), -(-height // (8 * vmax))
     by_id = {c["id"]: c for c in comps}
     scan = []
     for i in range(1, 1 + 2 * ns, 2):
@@ -442,50 +540,101 @@ def read_scan(data, pos, body, frame, qt, huff, interval):
         if c is None:
             raise ValueError(f"the scan names component {body[i]}, which is not in the frame or is named twice")
         td, ta = body[i + 1] >> 4, body[i + 1] & 15
-        for kind, table, key, slot in (("quantization", qt, c["tq"], c["tq"]), ("DC Huffman", huff, (0, td), td),
-                                       ("AC Huffman", huff, (1, ta), ta)):
+        needed = [("quantization", qt, c["tq"], c["tq"])]
+        if ss == 0 and not ah:
+            needed.append(("DC Huffman", huff, (0, td), td))
+        if se:
+            needed.append(("AC Huffman", huff, (1, ta), ta))
+        for kind, table, key, slot in needed:
             if key not in table:
                 raise ValueError(f"component {c['id']} uses {kind} table {slot}, which was never defined")
-        scan.append((c, huff[0, td], huff[1, ta], qt[c["tq"]]))
-    hmax, vmax = max(c["h"] for c in comps), max(c["v"] for c in comps)
-    mcux, mcuy = -(-width // (8 * hmax)), -(-height // (8 * vmax))
-    total = mcux * mcuy
+        if c["id"] in coefs and not progressive:
+            raise ValueError(f"component {c['id']} is in two baseline scans")
+        # The quantization table is taken when a component is first seen, as libjpeg does.
+        # Blocks are made only when the data reaches them, so a header cannot ask for memory alone.
+        q, blocks = coefs.setdefault(c["id"], (qt[c["tq"]], {}))
+        scan.append((c, huff.get((0, td)), huff.get((1, ta)), blocks, mcux * c["h"]))
+    if ns > 1:
+        # Interleaved: an MCU holds each component's h by v blocks in turn.
+        total = mcux * mcuy
+        units = lambda u: [(s, (u // mcux * c["v"] + j) * bw + u % mcux * c["h"] + i)
+                           for s, (c, _, _, _, bw) in enumerate(scan) for j in range(c["v"]) for i in range(c["h"])]
+    else:
+        # A lone component is read block by block, over its own size rather than whole MCUs.
+        c, _, _, _, bw = scan[0]
+        cbw, cbh = own_blocks(c, width, height, hmax, vmax)
+        total = cbw * cbh
+        units = lambda u: [(0, u // cbw * bw + u % cbw)]
     interval = interval or total
     pieces, rsts, end_pos = entropy_data(data, pos)
     if len(rsts) != -(-total // interval) - 1 or rsts != [i % 8 for i in range(len(rsts))]:
         raise ValueError(f"expected {-(-total // interval) - 1} restart markers in order, found {len(rsts)} numbered {rsts[:8]}")
-    planes = [[] for _ in scan]
-    mcu = 0
+    unit = 0
     for piece in pieces:
         bits = "".join(map(BYTE_BITS.__getitem__, piece))
         end = len(bits)
         # Zeros past the end (as libjpeg does) always read as some code, so running out is caught
         # by the check after each block, not mistaken for a bad code. One block reads < 2048 bits.
         bits += "0" * 2048
-        pos, pred = 0, [0] * ns
-        for _ in range(min(interval, total - mcu)):
-            my, mx = divmod(mcu, mcux)
-            for s, (c, dc, ac, q) in enumerate(scan):
-                h, v, plane = c["h"], c["v"], planes[s]
-                if mx == 0:
-                    plane += [bytearray(mcux * h * 8) for _ in range(8 * v)]
-                for j in range(v):
-                    for i in range(h):
-                        pos, zz = read_block(bits, pos, dc, ac, q)
-                        if pos > end:
-                            raise ValueError("the scan data ends in the middle of a block")
-                        pred[s] += zz[0]
-                        zz[0] = pred[s]
-                        coef = [0] * 64
-                        for k in range(64):
-                            if zz[k]:
-                                coef[ZIGZAG[k]] = zz[k] * q[k]
-                        samples = idct(coef)
-                        x0, y0 = (mx * h + i) * 8, (my * v + j) * 8
-                        for r in range(8):
-                            plane[y0 + r][x0:x0 + 8] = bytes(samples[8 * r:8 * r + 8])
-            mcu += 1
-    return [(c, plane) for (c, *_), plane in zip(scan, planes)], end_pos
+        pos, pred, eobrun = 0, [0] * ns, 0
+        for _ in range(min(interval, total - unit)):
+            for s, b in units(unit):
+                _, dc, ac, blocks, _ = scan[s]
+                blk = blocks.get(b)
+                if blk is None:
+                    # Inside an end-of-band run an unseen block stays all zeros and is not written.
+                    blk = ZEROS if progressive and eobrun else blocks.setdefault(b, [0] * 64)
+                if not progressive:
+                    pos, zz = read_block(bits, pos, dc, ac)
+                    pred[s] += zz[0]
+                    zz[0] = pred[s]
+                    blk[:] = zz
+                elif ss == 0 and not ah:
+                    size, pos = symbol_at(bits, pos, dc)
+                    diff, pos = received(bits, pos, size, 11)
+                    pred[s] += diff
+                    blk[0] = pred[s] << al
+                elif ss == 0:
+                    if bits[pos] == "1":
+                        blk[0] |= 1 << al
+                    pos += 1
+                elif not ah:
+                    pos, eobrun = ac_first(bits, pos, ac, blk, ss, se, al, eobrun)
+                else:
+                    pos, eobrun = ac_refine(bits, pos, ac, blk, ss, se, al, eobrun)
+                if pos > end:
+                    raise ValueError("the scan data ends in the middle of a block")
+            unit += 1
+    return end_pos
+
+
+def to_planes(frame, coefs):
+    # Once every scan is in: dequantize each block, inverse DCT it, and lay it in its plane.
+    width, height, comps = frame
+    hmax, vmax = max(c["h"] for c in comps), max(c["v"] for c in comps)
+    mcux, mcuy = -(-width // (8 * hmax)), -(-height // (8 * vmax))
+    planes = []
+    for c in comps:
+        if c["id"] not in coefs:
+            raise ValueError(f"component {c['id']} is in the frame but in no scan")
+        q, blocks = coefs[c["id"]]
+        bw, (cbw, cbh) = mcux * c["h"], own_blocks(c, width, height, hmax, vmax)
+        inside = [b for b in blocks if b % bw < cbw and b // bw < cbh]
+        if len(inside) != cbw * cbh:
+            raise ValueError(f"the scans never reach every block of component {c['id']}")
+        plane = [bytearray(cbw * 8) for _ in range(cbh * 8)]
+        for b in inside:
+            zz = blocks[b]
+            coef = [0] * 64
+            for k in range(64):
+                if zz[k]:
+                    coef[ZIGZAG[k]] = zz[k] * q[k]
+            samples = idct(coef)
+            x0, y0 = b % bw * 8, b // bw * 8
+            for r in range(8):
+                plane[y0 + r][x0:x0 + 8] = bytes(samples[8 * r:8 * r + 8])
+        planes.append((c, plane))
+    return planes
 
 
 def stretch(s):
@@ -524,12 +673,12 @@ def to_rgb(frame, planes, is_rgb):
 
 
 def decode(data):
-    # Returns width, height and the RGB pixels, row by row, of a baseline JPEG. Anything else
-    # (progressive, arithmetic, 12-bit, lossless, broken) is refused with a ValueError.
+    # Returns width, height and the RGB pixels, row by row, of a baseline or progressive JPEG.
+    # Anything else (arithmetic, 12-bit, lossless, broken) is refused with a ValueError.
     data = bytes(data)
     if data[:2] != b"\xff\xd8":
         raise ValueError("not a JPEG: it does not start with SOI (FF D8)")
-    qt, huff, frame, planes, interval, pos, transform = {}, {}, None, None, 0, 2, 1
+    qt, huff, frame, coefs, scans, interval, pos, transform = {}, {}, None, {}, 0, 0, 2, 1
     while True:
         if pos >= len(data):
             raise ValueError("the file ends before the EOI marker")
@@ -544,8 +693,8 @@ def decode(data):
         if marker == 0xD9:
             break
         if marker in REFUSED:
-            raise ValueError(f"{REFUSED[marker]} JPEGs are not supported, only baseline (SOF0)")
-        if marker not in (0xC0, 0xC4, 0xDA, 0xDB, 0xDD, 0xFE) and not 0xE0 <= marker <= 0xEF:
+            raise ValueError(f"{REFUSED[marker]} JPEGs are not supported, only baseline (SOF0) and progressive (SOF2)")
+        if marker not in (0xC0, 0xC2, 0xC4, 0xDA, 0xDB, 0xDD, 0xFE) and not 0xE0 <= marker <= 0xEF:
             raise ValueError(f"unknown marker 0xFF{marker:02X} at byte {start}")
         n = int.from_bytes(data[pos:pos + 2], "big")
         if n < 2 or pos + n > len(data):
@@ -559,17 +708,18 @@ def decode(data):
             if len(body) != 2:
                 raise ValueError("the DRI segment has the wrong length")
             interval = int.from_bytes(body, "big")
-        elif marker == 0xC0:
+        elif marker in (0xC0, 0xC2):
             if frame:
                 raise ValueError("the file has two frames")
-            frame = read_frame(body)
+            frame, progressive = read_frame(body), marker == 0xC2
         elif marker == 0xDA:
-            if frame is None or planes is not None:
-                raise ValueError("a scan before the frame header, or a second scan, is not supported")
-            planes, pos = read_scan(data, pos, body, frame, qt, huff, interval)
-    if planes is None:
+            if frame is None:
+                raise ValueError("a scan comes before the frame header")
+            pos = read_scan(data, pos, body, frame, qt, huff, interval, coefs, progressive)
+            scans += 1
+    if not scans:
         raise ValueError("the file has no scan (SOS)")
-    return frame[0], frame[1], to_rgb(frame, planes, transform == 0)
+    return frame[0], frame[1], to_rgb(frame, to_planes(frame, coefs), transform == 0)
 
 
 if __name__ == "__main__":
