@@ -638,5 +638,25 @@ for n in range(200):
         check(False, f"progressive flip {n}: raised {e!r}")
 print(f"broken progressive scans refused; 200 bit-flipped files: {decoded} decoded, the rest refused with ValueError")
 
+# The progressive encoder sends the very same coefficients in several scans, so Pillow (libjpeg)
+# and our decoder must both read it as exactly the pixels of the baseline file, at every layout.
+sizes = []
+for label, image in IMAGES.items():
+    for opts in ({}, {"subsample": False}, {"grey": True}):
+        args = (image.tobytes(), image.width, image.height, 75)
+        base, prog = jpeg.encode(*args, optimize=True, **opts), jpeg.encode(*args, progressive=True, **opts)
+        check(b"\xff\xc2" in prog, f"{label} {opts}: no SOF2 marker in the progressive file")
+        check(theirs_decode(prog).tobytes() == theirs_decode(base).tobytes(), f"{label} {opts}: Pillow read our progressive file differently")
+        check(our_decode(prog, label) == our_decode(base, label), f"{label} {opts}: our decoder read our progressive file differently")
+        sizes.append((label, opts, len(base), len(prog)))
+try:
+    jpeg.encode(b"\x00" * 3, 1, 1, progressive=True, restart=1)
+    check(False, "progressive with restart markers was accepted")
+except ValueError:
+    pass
+render = [(b, p) for label, opts, b, p in sizes if "render" in label and not opts]
+print("progressive files read by Pillow and by us as exactly the baseline pixels;",
+      f"the render: {render[0][0]} bytes optimized baseline, {render[0][1]} progressive" if render else "")
+
 print("FAILURES" if failures else "ok")
 sys.exit(1 if failures else 0)

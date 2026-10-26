@@ -31,6 +31,9 @@ Huffman coded.
   the procedure in Annex K.2 (codes at most 16 bits, none all ones), and a
   second pass writes the data with them. Without it the output is byte for
   byte what it was before the option existed.
+- `--progressive` (or `progressive=True`): the same coefficients in six scans
+  instead of one, so a viewer can show the whole picture blurred first and
+  sharpen it. Each scan gets its own Huffman table. See DOCS.md.
 - `--restart N` (or `restart=N`): a DRI segment, and every N MCUs the byte is
   ended with RST0 to RST7 in turn and DC starts again from zero, so a damaged
   byte spoils only the stretch up to the next marker. The pixels do not change.
@@ -122,7 +125,7 @@ lowest is 51.90 dB, and a flat colour at 4:4:4 comes out exactly equal. Restart 
 
 ## Running it
 
-    python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize] [--restart N]
+    python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize] [--progressive] [--restart N]
     python jpeg.py -d IN.jpg [-o OUT.png]
     python test_jpeg.py
 

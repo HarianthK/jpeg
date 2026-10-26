@@ -488,6 +488,34 @@ Reading every scan into a store first costs baseline files a little: 1.11
 seconds against 1.01 for the render at quality 75, medians of five runs
 alternating the old and new decoder in one process.
 
+### Writing them too
+
+With a decoder that reads progressive files, the encoder can write them, and
+the decoder's best test turns into the encoder's: a progressive file holds the
+very same quantized coefficients as the baseline one, so Pillow must read ours
+as exactly the pixels of our baseline file, and so must our own decoder. Both
+do, for every test picture at 4:2:0, 4:4:4 and greyscale.
+
+The scans are spectral selection only (the simplest of libjpeg's options):
+every DC coefficient in one interleaved scan, then luma's AC in two bands,
+1 to 5 and 6 to 63, then each chroma component's AC 1 to 63. A scan of one
+component covers that component's own blocks, not the padding that fills out
+the last MCU, which the decoder does not expect. Each scan gets a Huffman table
+built for it, because the standard tables have no codes for end-of-band runs,
+and those runs are where progressive files save: a band that is empty in a
+thousand blocks in a row costs one symbol and ten bits.
+
+On the render at quality 75 that comes to 17,215 bytes against 17,350 for an
+optimized baseline file, 0.8 % smaller. Tiny pictures grow instead, since every
+scan carries a table of its own. Successive approximation, sending the high
+bits of every coefficient first and refining them later, would save more and
+is the next step.
+
+Breakages: coefficient 6 left out of both bands fails 30 checks, scanning the
+MCU padding fails 4, and a run size one too big fails 42. Sending the run count
+whole instead of less its top bit fails nothing, and is no bug: the bit writer
+keeps only the low r bits, and a count of r bits' size always has 2^r on top.
+
 ### Why it differs from Pillow by a few levels
 
 Three steps round differently. libjpeg's default inverse DCT is in integers
@@ -596,7 +624,8 @@ not only at the exception type.
 
 ## What it does not do
 
-The encoder writes no progressive files and no EXIF. The decoder refuses
+The encoder writes no EXIF, and its progressive files use spectral selection
+only, no successive approximation. The decoder refuses
 arithmetic coded, lossless, hierarchical and 12-bit files (8-bit extended SOF1 files are read),
 sampling other than 1x or 2x the chroma (4:1:1), and four components (CMYK). It ignores EXIF orientation and ICC profiles. A file with
 no JFIF or Adobe segment and components named R, G and B is read as YCbCr,

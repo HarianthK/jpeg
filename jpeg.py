@@ -220,15 +220,83 @@ def encode_block(w, zz, prev_dc, dc, ac):
     return zz[0]
 
 
+def ac_band(w, ac, zzs, ss, se):
+    # One component's coefficients ss to se in every block. Blocks with nothing left in the band are
+    # sent as one end-of-band run (G.1.2.2): symbol r << 4, then r more bits of the count.
+    eobrun = 0
+
+    def end_run():
+        nonlocal eobrun
+        if eobrun:
+            r = eobrun.bit_length() - 1
+            w.write(*ac[r << 4])
+            w.write(eobrun - (1 << r), r)
+            eobrun = 0
+    for zz in zzs:
+        band = zz[ss:se + 1]
+        if any(band):
+            end_run()
+            run = 0
+            for v in band:
+                if v == 0:
+                    run += 1
+                    continue
+                while run > 15:
+                    w.write(*ac[0xF0])
+                    run -= 16
+                s, bits = category(v)
+                w.write(*ac[(run << 4) | s])
+                w.write(bits, s)
+                run = 0
+            if not run:
+                continue
+        eobrun += 1  # this block's band ends here, so it joins the run
+        if eobrun == 0x7FFF:
+            end_run()
+    end_run()
+
+
+def coded(scan, n):
+    # A scan written twice: once to count its symbols, then with n Huffman tables built from them.
+    tallies = [Tally() for _ in range(n)]
+    scan(types.SimpleNamespace(write=lambda value, bits: None), *tallies)
+    tables = [build_table(t.counts) for t in tallies]
+    w = BitWriter()
+    scan(w, *(huffman_codes(t) for t in tables))
+    w.flush()
+    return tables, bytes(w.out)
+
+
+def progressive_scans(units, grids):
+    # Spectral selection only: every DC in one interleaved scan, then each component's AC bands.
+    def dc_scan(w, *dc):
+        prev = [0, 0, 0]
+        for c, zz in units:
+            s, bits = category(zz[0] - prev[c])
+            w.write(*dc[min(c, 1)][s])
+            w.write(bits, s)
+            prev[c] = zz[0]
+    ids = range(len(grids))
+    tables, data = coded(dc_scan, min(len(grids), 2))
+    out = [segment(0xFFC4, b"".join(bytes([slot]) + bytes(t[0]) + t[1] for slot, t in zip((0x00, 0x01), tables))),
+           segment(0xFFDA, bytes([len(grids)]) + b"".join(bytes([c + 1, min(c, 1) << 4]) for c in ids) + bytes([0, 0, 0])), data]
+    for c, ss, se in ([(0, 1, 5), (0, 6, 63)] + [(c, 1, 63) for c in ids if c]):
+        (table,), data = coded(lambda w, ac: ac_band(w, ac, grids[c], ss, se), 1)
+        out += [segment(0xFFC4, bytes([0x10]) + bytes(table[0]) + table[1]), segment(0xFFDA, bytes([1, c + 1, 0x00, ss, se, 0])), data]
+    return b"".join(out)
+
+
 def segment(marker, body):
     return struct.pack(">HH", marker, len(body) + 2) + body
 
 
-def encode(rgb, width, height, quality=75, subsample=True, optimize=False, grey=False, restart=0):
+def encode(rgb, width, height, quality=75, subsample=True, optimize=False, grey=False, restart=0, progressive=False):
     # rgb is width * height * 3 bytes, row by row. Returns the bytes of a JFIF file.
     # optimize counts this picture's symbols first and builds its own Huffman tables from them.
     if not 0 <= restart < 65536:
         raise ValueError("restart is 0 to 65535 MCUs")
+    if progressive and restart:
+        raise ValueError("restart markers are not written in progressive files")
     if not (0 < width < 65536 and 0 < height < 65536) or len(rgb) != width * height * 3:
         raise ValueError("rgb must be width * height * 3 bytes, each side 1 to 65535")
     luma_q, chroma_q = quant_tables(quality)
@@ -242,16 +310,18 @@ def encode(rgb, width, height, quality=75, subsample=True, optimize=False, grey=
         return [plane[y0 + j][x0 + i] for j in range(8) for i in range(8)]
 
     # Interleaved: each MCU holds its luma blocks left to right, top to bottom, then one Cb and one Cr.
-    blocks = []
+    blocks, at = [], ({}, {}, {})  # at: each component's blocks by (row, column), for progressive scans
     for my in range(0, len(y_plane), mcu):
         for mx in range(0, len(y_plane[0]), mcu):
             for dy in range(0, mcu, 8):
                 for dx in range(0, mcu, 8):
                     blocks.append((0, coefficients(block(y_plane, mx + dx, my + dy), luma_q)))
+                    at[0][(my + dy) // 8, (mx + dx) // 8] = blocks[-1][1]
             if not grey:
                 cx, cy = (mx // 2, my // 2) if subsample else (mx, my)
                 blocks.append((1, coefficients(block(cb, cx, cy), chroma_q)))
                 blocks.append((2, coefficients(block(cr, cx, cy), chroma_q)))
+                at[1][cy // 8, cx // 8], at[2][cy // 8, cx // 8] = blocks[-2][1], blocks[-1][1]
 
     # restart: every that many MCUs, end the byte, write RST0 to RST7 in turn and start DC from zero,
     # so a damaged byte spoils only up to the next marker.
@@ -275,6 +345,13 @@ def encode(rgb, width, height, quality=75, subsample=True, optimize=False, grey=
     code(w, *(huffman_codes(t) for t in tables))
     w.flush()
 
+    if progressive:
+        # A scan of one component covers only that component's own blocks, not the MCU padding.
+        own = lambda w, h: [(r, c) for r in range(-(-h // 8)) for c in range(-(-w // 8))]
+        cw, ch = (-(-width // 2), -(-height // 2)) if subsample else (width, height)
+        grids = [[at[0][k] for k in own(width, height)]] + ([] if grey else [[at[c][k] for k in own(cw, ch)] for c in (1, 2)])
+        # A lone component's DC scan is not interleaved either, so it too goes block by block.
+        units = [(0, zz) for zz in grids[0]] if grey else blocks
     luma_sampling = 0x22 if subsample else 0x11
     dqt = b"\x00" + bytes(luma_q[z] for z in ZIGZAG)
     if grey:
@@ -284,10 +361,10 @@ def encode(rgb, width, height, quality=75, subsample=True, optimize=False, grey=
         dqt += b"\x01" + bytes(chroma_q[z] for z in ZIGZAG)
         sof = struct.pack(">BHHB", 8, height, width, 3) + bytes([1, luma_sampling, 0, 2, 0x11, 1, 3, 0x11, 1])
         sos = bytes([3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0])
-    return b"".join([
-        b"\xff\xd8",
-        segment(0xFFE0, b"JFIF\0\x01\x01\x00" + struct.pack(">HHBB", 1, 1, 0, 0)),
-        segment(0xFFDB, dqt),
+    head = [b"\xff\xd8", segment(0xFFE0, b"JFIF\0\x01\x01\x00" + struct.pack(">HHBB", 1, 1, 0, 0)), segment(0xFFDB, dqt)]
+    if progressive:
+        return b"".join(head + [segment(0xFFC2, sof), progressive_scans(units, grids), b"\xff\xd9"])
+    return b"".join(head + [
         segment(0xFFC0, sof),
         segment(0xFFC4, b"".join(bytes([tc_th]) + bytes(t[0]) + t[1] for tc_th, t in
                                  zip((0x00, 0x10, 0x01, 0x11), tables))),
@@ -727,7 +804,7 @@ if __name__ == "__main__":
     argv = sys.argv[1:]
     args = [a for i, a in enumerate(argv) if not a.startswith("-") and (i == 0 or argv[i - 1] not in ("-o", "-q", "--restart"))]
     if not args:
-        sys.exit("usage: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize] [--restart N]\n"
+        sys.exit("usage: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize] [--progressive] [--restart N]\n"
                  "       python jpeg.py -d IN.jpg [-o OUT.png]")
     from PIL import Image  # only to read or write the PNG; the JPEG is all this file
     source = args[0]
@@ -745,7 +822,7 @@ if __name__ == "__main__":
     quality = int(argv[argv.index("-q") + 1]) if "-q" in argv else 75
     image = Image.open(source).convert("RGB")
     packed = encode(image.tobytes(), image.width, image.height, quality, subsample="--444" not in argv,
-                    optimize="--optimize" in argv, grey="--grey" in argv,
+                    optimize="--optimize" in argv, grey="--grey" in argv, progressive="--progressive" in argv,
                     restart=int(argv[argv.index("--restart") + 1]) if "--restart" in argv else 0)
     open(out, "wb").write(packed)
     raw = image.width * image.height * 3
