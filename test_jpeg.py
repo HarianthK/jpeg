@@ -454,7 +454,10 @@ refused(bytes(patched), "frame uses quantization table 3, never defined", "never
 refused(pillow_jpeg(IMAGES["noise 17x9"], quality=75, streamtype=2), "Pillow's abbreviated file, no tables", "never defined")
 # Ones from the first scan byte on: longer than any DC luma code in Annex K, so it matches nothing.
 refused(small[:scan_start] + b"\xff\x00" * 4 + small[scan_start + 8:], "a code that matches nothing", "matches nothing")
-for marker, words in ((0xC9, "arithmetic"), (0xC3, "lossless"), (0xC2, "progressive"), (0xC1, "extended")):
+patched = bytearray(small)
+patched[at[0xC0] + 1] = 0xC1
+check(our_decode(bytes(patched), "SOF1") == our_decode(small, "SOF0"), "an 8-bit SOF1 file decoded differently from the same file as SOF0")
+for marker, words in ((0xC9, "arithmetic"), (0xC3, "lossless"), (0xC2, "progressive")):
     patched = bytearray(small)
     patched[at[0xC0] + 1] = marker
     refused(bytes(patched), f"SOF0 marked 0xFF{marker:02X}", words)

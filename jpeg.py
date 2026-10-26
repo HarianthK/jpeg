@@ -299,7 +299,7 @@ def encode(rgb, width, height, quality=75, subsample=True, optimize=False, grey=
 
 
 # Reading. Everything from here on trusts nothing in the file; see DOCS.md.
-REFUSED = {0xC1: "extended sequential (SOF1)", 0xC3: "lossless (SOF3)",
+REFUSED = {0xC3: "lossless (SOF3)",
            0xC9: "arithmetic coded (SOF9)", 0xCA: "progressive arithmetic coded (SOF10)",
            0xCB: "lossless arithmetic coded (SOF11)", 0xCC: "arithmetic coded (DAC)", 0xDC: "DNL marker"}
 REFUSED.update({m: f"hierarchical (marker 0xFF{m:02X})" for m in (0xC5, 0xC6, 0xC7, 0xCD, 0xCE, 0xCF, 0xDE, 0xDF)})
@@ -694,7 +694,7 @@ def decode(data):
             break
         if marker in REFUSED:
             raise ValueError(f"{REFUSED[marker]} JPEGs are not supported, only baseline (SOF0) and progressive (SOF2)")
-        if marker not in (0xC0, 0xC2, 0xC4, 0xDA, 0xDB, 0xDD, 0xFE) and not 0xE0 <= marker <= 0xEF:
+        if marker not in (0xC0, 0xC1, 0xC2, 0xC4, 0xDA, 0xDB, 0xDD, 0xFE) and not 0xE0 <= marker <= 0xEF:
             raise ValueError(f"unknown marker 0xFF{marker:02X} at byte {start}")
         n = int.from_bytes(data[pos:pos + 2], "big")
         if n < 2 or pos + n > len(data):
@@ -708,7 +708,8 @@ def decode(data):
             if len(body) != 2:
                 raise ValueError("the DRI segment has the wrong length")
             interval = int.from_bytes(body, "big")
-        elif marker in (0xC0, 0xC2):
+        elif marker in (0xC0, 0xC1, 0xC2):
+            # SOF1 (extended) differs from baseline only in allowing 12 bits, which read_frame refuses.
             if frame:
                 raise ValueError("the file has two frames")
             frame, progressive = read_frame(body), marker == 0xC2

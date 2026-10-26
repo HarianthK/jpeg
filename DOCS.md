@@ -384,7 +384,7 @@ across two files. Of the flips, 191 still decode to a picture of the right
 size and every other one is refused with `ValueError`, never anything else.
 
 A file can also be valid and simply not something this reads. Arithmetic
-coded, lossless, hierarchical, extended (SOF1) and 12-bit files are refused by
+coded, lossless, hierarchical and 12-bit files are refused by
 name, for example "lossless (SOF3) JPEGs are not supported, only baseline
 (SOF0) and progressive (SOF2)". The test checks that wording on a real file
 with its SOF0 marker or precision byte changed.
@@ -597,7 +597,7 @@ not only at the exception type.
 ## What it does not do
 
 The encoder writes no progressive files and no EXIF. The decoder refuses
-arithmetic coded, lossless, hierarchical, extended (SOF1) and 12-bit files,
+arithmetic coded, lossless, hierarchical and 12-bit files (8-bit extended SOF1 files are read),
 sampling other than 1x or 2x the chroma (4:1:1), and four components (CMYK). It ignores EXIF orientation and ICC profiles. A file with
 no JFIF or Adobe segment and components named R, G and B is read as YCbCr,
 where libjpeg would read it as RGB.
