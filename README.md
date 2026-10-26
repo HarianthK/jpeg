@@ -31,8 +31,8 @@ Huffman coded.
   the procedure in Annex K.2 (codes at most 16 bits, none all ones), and a
   second pass writes the data with them. Without it the output is byte for
   byte what it was before the option existed.
-- `--progressive` (or `progressive=True`): the same coefficients in six scans
-  instead of one, so a viewer can show the whole picture blurred first and
+- `--progressive` (or `progressive=True`): the same coefficients in five scans
+  (three in greyscale) instead of one, so a viewer can show the whole picture blurred first and
   sharpen it. Each scan gets its own Huffman table. See DOCS.md.
 - `--restart N` (or `restart=N`): a DRI segment, and every N MCUs the byte is
   ended with RST0 to RST7 in turn and DC starts again from zero, so a damaged
