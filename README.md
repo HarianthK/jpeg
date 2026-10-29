@@ -47,7 +47,12 @@ Reading, with `decode(data)` or `-d`:
 - Progressive scans of every kind: DC and AC bands, end-of-band runs, and the
   refinement scans that add one more bit of precision at a time.
 - DQT, DHT, SOS, DRI and restart markers, byte stuffing and fill bytes; APPn
-  and COM segments are skipped.
+  and COM segments are skipped, apart from the EXIF orientation.
+- The EXIF orientation, the tag a phone writes instead of turning its
+  pixels. `decode(data, upright=True)` turns or mirrors the picture to match,
+  for all eight values, the same way Pillow's `exif_transpose` does; `-d` always
+  writes it upright, since a PNG has nowhere to keep the tag. A broken EXIF
+  segment is ignored, not refused, because the picture itself is fine.
 - Huffman decoding through a 16-bit lookup table, zigzag undone, the inverse
   DCT, libjpeg's "fancy" chroma upsampling (3/4 of the nearer sample, 1/4 of
   the next), and the JFIF equations back to RGB, clamped to 0..255.

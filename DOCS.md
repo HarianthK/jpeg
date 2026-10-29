@@ -622,11 +622,42 @@ end of a Python list grows the list instead of failing, so the bad table was
 built without complaint. That is why the refusal checks look at the reason,
 not only at the exception type.
 
+## EXIF orientation
+
+A phone held sideways does not turn its pixels. It stores them as the sensor
+saw them and writes a tag, 0x0112 in the first IFD of an APP1 "Exif" segment,
+saying how to show them. The eight values are the eight ways to lay a
+rectangle down: 1 as stored, 2 mirrored, 3 turned half way, 4 upside down
+mirrored, and 5 to 8 the same four with rows and columns swapped first. That
+gives the whole of `turn_upright`: transpose if the value is 5 or more, then
+`(value - 1) % 4` says whether to mirror left to right, top to bottom, both or
+neither. 6, the usual phone portrait, comes out as transpose then mirror, which
+is a quarter turn clockwise.
+
+The EXIF block is a small TIFF file: two bytes of byte order ("II" little
+endian, "MM" big), 42, and the offset of the first IFD, counted from the start
+of the TIFF header, not from the segment. Each IFD entry is 12 bytes: tag,
+type, count and a value that fits in 4 bytes or the offset to one that does
+not. Orientation is type 3, a SHORT, in the first two of those bytes.
+
+`decode` leaves the pixels as stored unless `upright=True`, as `Image.open`
+does; `-d` writes a PNG, which has no such tag, so it always turns them. A
+broken EXIF segment is not a broken picture, so a bad byte order, a short
+IFD, a value outside 1 to 8 or a tag of the wrong type all count as 1 rather
+than raising. Only the first Exif segment counts.
+
+The test has Pillow write all eight values, then builds EXIF by hand in both
+byte orders, with the tag second in its IFD and with the IFD not straight after
+the header, and compares our upright pixels with `ImageOps.exif_transpose` of
+Pillow's decoding. Twelve breakages, each caught; two (the IFD offset taken as
+8, and `-d` writing the stored pixels) passed until those last two cases were
+added, because Pillow always puts its IFD at byte 8.
+
 ## What it does not do
 
 The encoder writes no EXIF, and its progressive files use spectral selection
 only, no successive approximation. The decoder refuses
 arithmetic coded, lossless, hierarchical and 12-bit files (8-bit extended SOF1 files are read),
-sampling other than 1x or 2x the chroma (4:1:1), and four components (CMYK). It ignores EXIF orientation and ICC profiles. A file with
+sampling other than 1x or 2x the chroma (4:1:1), and four components (CMYK). It ignores ICC profiles. A file with
 no JFIF or Adobe segment and components named R, G and B is read as YCbCr,
 where libjpeg would read it as RGB.

@@ -658,5 +658,64 @@ render = [(b, p) for label, opts, b, p in sizes if "render" in label and not opt
 print("progressive files read by Pillow and by us as exactly the baseline pixels;",
       f"the render: {render[0][0]} bytes optimized baseline, {render[0][1]} progressive" if render else "")
 
+# EXIF orientation: upright=True must turn the pixels exactly as Pillow's exif_transpose does.
+def exif(order, entries, gap=0):
+    # A TIFF header, gap spare bytes, then one IFD of (tag, type, value) entries, in either byte order.
+    num = lambda v, n: v.to_bytes(n, "little" if order == b"II" else "big")
+    ifd = num(len(entries), 2) + b"".join(num(t, 2) + num(k, 2) + num(1, 4) + num(v, 2) + b"\0\0" for t, k, v in entries)
+    return b"Exif\0\0" + order + num(42, 2) + num(8 + gap, 4) + bytes(gap) + ifd + num(0, 4)
+
+
+def with_app1(data, body):
+    return data[:2] + b"\xff\xe1" + (len(body) + 2).to_bytes(2, "big") + body + data[2:]
+
+
+def turned_like_pillow(data, where):
+    from PIL import ImageOps
+    got = our_decode(data, where)
+    try:
+        width, height, rgb = jpeg.decode(data, upright=True)
+    except Exception as e:
+        return check(False, f"{where}: upright decode raised {e!r}")
+    theirs = ImageOps.exif_transpose(theirs_decode(data)).convert("RGB")
+    check((width, height) == theirs.size, f"{where}: upright size {width}x{height}, Pillow {theirs.size}")
+    other = theirs.tobytes()
+    worst = max(abs(a - b) for a, b in zip(rgb, other)) if len(rgb) == len(other) else None
+    check(worst is not None and worst <= 3, f"{where}: upright pixels off from Pillow's by {worst}")
+    check(got is not None and got[:2] == theirs_decode(data).size, f"{where}: decode() without upright turned the picture")
+
+
+base = IMAGES["gradient 33x21"]
+for o in range(1, 9):
+    e = Image.Exif()
+    e[0x0112] = o
+    turned_like_pillow(pillow_jpeg(base, quality=90, subsampling=0, exif=e.tobytes()), f"Pillow's EXIF, orientation {o}")
+plain = pillow_jpeg(base, quality=90, subsampling=0)
+for order in (b"II", b"MM"):
+    for o in (3, 6, 8):
+        # The orientation second in its IFD, after an ImageWidth entry, as cameras often write it.
+        turned_like_pillow(with_app1(plain, exif(order, [(0x0100, 3, 33), (0x0112, 3, o)])), f"{order.decode()} EXIF, orientation {o}")
+    # An IFD that does not start straight after the header, so its offset has to be followed.
+    turned_like_pillow(with_app1(plain, exif(order, [(0x0112, 3, 6)], gap=10)), f"{order.decode()} EXIF, IFD at byte 18")
+for body, why in ((exif(b"MM", [(0x0112, 3, 9)]), "orientation 9"), (exif(b"II", [(0x0112, 4, 6)]), "orientation stored as a LONG"),
+                  (exif(b"II", [(0x0112, 3, 6)])[:20], "IFD cut short"), (b"Exif\0\0XX" + bytes(20), "no byte order")):
+    got = our_decode(with_app1(plain, body), why)
+    try:
+        check(jpeg.decode(with_app1(plain, body), upright=True) == got, f"broken EXIF ({why}) turned the picture")
+    except Exception as e:
+        check(False, f"broken EXIF ({why}) raised {e!r}")
+check(jpeg.decode(with_app1(with_app1(plain, exif(b"II", [(0x0112, 3, 1)])), exif(b"II", [(0x0112, 3, 6)])), upright=True)[:2] == (21, 33),
+      "a second Exif segment was not ignored")
+# -d writes a PNG, which has no orientation tag, so it writes the picture upright.
+open("t-turned.jpg", "wb").write(with_app1(plain, exif(b"II", [(0x0112, 3, 6)])))
+try:
+    run = subprocess.run([sys.executable, jpeg.__file__, "-d", "t-turned.jpg", "-o", "t-turned.png"], capture_output=True, text=True)
+    check(run.returncode == 0 and "21x33" in run.stdout, f"command line -d on orientation 6: {run}")
+finally:
+    for name in ("t-turned.jpg", "t-turned.png"):
+        if os.path.exists(name):
+            os.remove(name)
+print("EXIF orientation 1 to 8, both byte orders, turned as Pillow's exif_transpose turns them; broken EXIF ignored")
+
 print("FAILURES" if failures else "ok")
 sys.exit(1 if failures else 0)

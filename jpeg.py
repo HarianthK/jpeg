@@ -749,10 +749,39 @@ def to_rgb(frame, planes, is_rgb):
     return bytes(rgb)
 
 
-def decode(data):
+def exif_orientation(body):
+    # Tag 0x0112 of the first IFD in an APP1 "Exif" segment, 1 to 8; a broken or missing one counts as 1.
+    tiff = body[6:]
+    order = {b"II": "little", b"MM": "big"}.get(tiff[:2])
+    if body[:6] != b"Exif\0\0" or order is None or len(tiff) < 8:
+        return 1
+    num = lambda at, n: int.from_bytes(tiff[at:at + n], order)
+    ifd = num(4, 4)
+    for at in range(ifd + 2, min(ifd + 2 + 12 * num(ifd, 2), len(tiff) - 11), 12):
+        if num(at, 2) == 0x0112 and num(at + 2, 2) == 3:
+            value = num(at + 8, 2)
+            return value if 1 <= value <= 8 else 1
+    return 1
+
+
+def turn_upright(width, height, rgb, orientation):
+    # Turns stored pixels the way a viewer shows them: 5 to 8 swap rows and columns, then each may flip.
+    rows = [[rgb[i:i + 3] for i in range(y * 3 * width, (y + 1) * 3 * width, 3)] for y in range(height)]
+    if orientation >= 5:
+        rows, width, height = [list(r) for r in zip(*rows)], height, width
+    turn = (orientation - 1) % 4
+    if turn in (1, 2):
+        rows = [r[::-1] for r in rows]
+    if turn in (2, 3):
+        rows = rows[::-1]
+    return width, height, b"".join(p for r in rows for p in r)
+
+
+def decode(data, upright=False):
     # Returns width, height and the RGB pixels, row by row, of a baseline or progressive JPEG.
-    # Anything else (arithmetic, 12-bit, lossless, broken) is refused with a ValueError.
+    # Anything else is refused with a ValueError. upright=True applies the EXIF orientation, as viewers do.
     data = bytes(data)
+    orientation = None
     if data[:2] != b"\xff\xd8":
         raise ValueError("not a JPEG: it does not start with SOI (FF D8)")
     qt, huff, frame, coefs, scans, interval, pos, transform = {}, {}, None, {}, 0, 0, 2, 1
@@ -781,6 +810,8 @@ def decode(data):
             read_tables(marker, body, qt, huff)
         elif marker == 0xEE and body[:5] == b"Adobe" and len(body) >= 12:
             transform = body[11]  # 0 means the three components are R, G and B, not YCbCr
+        elif marker == 0xE1 and body[:6] == b"Exif\0\0" and orientation is None:
+            orientation = exif_orientation(body)
         elif marker == 0xDD:
             if len(body) != 2:
                 raise ValueError("the DRI segment has the wrong length")
@@ -797,7 +828,8 @@ def decode(data):
             scans += 1
     if not scans:
         raise ValueError("the file has no scan (SOS)")
-    return frame[0], frame[1], to_rgb(frame, to_planes(frame, coefs), transform == 0)
+    picture = frame[0], frame[1], to_rgb(frame, to_planes(frame, coefs), transform == 0)
+    return turn_upright(*picture, orientation) if upright and orientation not in (None, 1) else picture
 
 
 if __name__ == "__main__":
@@ -812,7 +844,7 @@ if __name__ == "__main__":
         out = argv[argv.index("-o") + 1] if "-o" in argv else source.rsplit(".", 1)[0] + ".png"
         packed = open(source, "rb").read()
         try:
-            width, height, rgb = decode(packed)
+            width, height, rgb = decode(packed, upright=True)
         except ValueError as e:
             sys.exit(f"{source}: {e}")
         Image.frombytes("RGB", (width, height), rgb).save(out)
