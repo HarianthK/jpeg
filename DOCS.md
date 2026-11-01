@@ -383,10 +383,9 @@ each of its 148 bytes with the EOI put back, and 300 seeded random bit flips
 across two files. Of the flips, 191 still decode to a picture of the right
 size and every other one is refused with `ValueError`, never anything else.
 
-A file can also be valid and simply not something this reads. Arithmetic
-coded, lossless, hierarchical and 12-bit files are refused by
-name, for example "lossless (SOF3) JPEGs are not supported, only baseline
-(SOF0) and progressive (SOF2)". The test checks that wording on a real file
+A file can also be valid and simply not something this reads. Lossless,
+hierarchical and 12-bit files are refused by name, for example "lossless
+(SOF3) JPEGs are not supported, only sequential and progressive DCT ones". The test checks that wording on a real file
 with its SOF0 marker or precision byte changed.
 
 Sizes in the header are not trusted either. One flipped bit can turn a width of
@@ -657,7 +656,79 @@ added, because Pillow always puts its IFD at byte 8.
 
 The encoder writes no EXIF, and its progressive files use spectral selection
 only, no successive approximation. The decoder refuses
-arithmetic coded, lossless, hierarchical and 12-bit files (8-bit extended SOF1 files are read),
+lossless, hierarchical and 12-bit files (8-bit extended SOF1 files are read, and so are arithmetic coded ones),
 sampling other than 1x or 2x the chroma (4:1:1), and four components (CMYK). It ignores ICC profiles. A file with
 no JFIF or Adobe segment and components named R, G and B is read as YCbCr,
 where libjpeg would read it as RGB.
+
+## Arithmetic coding
+
+The standard has two ways to pack the coefficients. Huffman coding, which
+everyone uses, gives each symbol a whole number of bits. Arithmetic coding
+(Annex D) codes one yes-or-no decision at a time, each against a probability
+it learns as it goes, so a decision that is nearly always "no" costs a small
+fraction of a bit. From the same coefficients, libjpeg-turbo's 227x149
+`testorig.jpg` is 5,770 bytes with the standard Huffman tables, 5,463 with
+tables made for it (`jpegtran -optimize`), and 5,153 arithmetic coded, 6%
+smaller again. It was patented when JPEG was new, so libjpeg left it out
+until 2009, and most programs still cannot read it. libjpeg-turbo can.
+
+The decoder keeps two numbers, A (the size of the current interval) and C
+(where the data falls in it), and reads a byte at a time into C. For each
+decision it looks up Qe, the estimated chance of the less probable symbol,
+from the state of the decision's bin. Each bin is one byte: a state number 0
+to 113, and which symbol is more probable. The interval is split into a part
+of size Qe and the rest; which part C falls in is the answer, and the bin
+moves to the next state of Table D.2, more sure after the probable symbol and
+less after the other, swapping which one is probable at the states marked so.
+When A falls below half, both are doubled until it is not. That is all of
+`Arith.bit`, written as libjpeg's `arith_decode` is, including its start: C
+is read two bytes ahead before the first decision, and past the end of the
+data the reader takes zeros, which the standard allows, so a marker may come
+before the last decisions are made.
+
+What makes it JPEG is which bin each decision uses (Annex F). A DC difference
+asks "zero?", "negative?", then "is the size over 1, 2, 4, ..." in a row of
+bins, then each lower bit; the first bins depend on how big the last
+difference was, sorted by DAC's limits L and U. An AC coefficient asks "end
+of block?" and "zero?" in bins of its own position, so the coder learns that
+high frequencies are mostly zero; signs use a fixed half-and-half bin (state
+113, which is libjpeg's, not the table's); sizes use one of two rows of bins,
+split at DAC's K. Progressive scans use the same questions, and refinement
+scans ask "one more bit?" of each known coefficient and "new one here?" of
+the others, with "end of band?" only past the last coefficient known before,
+since before it the answer is always no. There are no end-of-band runs: an
+end of block costs so little that there is nothing to save. Every restart
+marker sets the bins back to state 0, as the DC predictions are.
+
+The 114 states were typed from Table D.2 and then compared with
+libjpeg-turbo's `jaricom.c` entry by entry, since one picture never visits
+all of them. The test is lossless like the progressive one: `scans/` holds
+`jpegtran -arithmetic` versions of its pictures, sequential, with restarts,
+spectral selection, successive approximation, one scan per component, 4:4:0
+and greyscale, made by libjpeg-turbo 2.1.1 (`jpegtran -arithmetic -scans
+scans/successive.txt -restart 2B -outfile scans/420_arith_successive.jpg
+scans/420.jpg`), and each must decode to exactly the pixels of its source.
+The first version did, on its first run. jpegtran writes DAC even when it
+holds the values a reader assumes anyway, so each file is also read with
+every DAC segment taken out, which is the only thing that tests the
+defaults. Bad DAC entries are refused, and 200 bit-flipped files are either
+read or refused with `ValueError`.
+
+Sixteen breakages were tried and fifteen fail the test: a Qe value one off,
+the exchange inverted, the switch ignored, the wrong next state, one start
+byte instead of two, an adaptive sign bin, the large DC context, one row of
+magnitude bins, refinement's end-of-block asked everywhere or its last known
+coefficient found over the whole block, both DAC defaults, a first AC pass not
+scaled, a DC refinement bit in the wrong place, and a DAC table id over 3.
+The one that passed reads a magnitude's lower bits one bin lower. That moves
+every such bin onto a neighbour nothing else uses, so the decoder is the same
+decoder with its bins renamed, and no file could tell, short of coefficients
+near 2^14. A noisy picture at quality 95 (`scans/noise.jpg`, with arithmetic
+twins) was added to make sure, and confirmed it.
+
+libjpeg-turbo's own `testimgari.jpg` is no use as a lossless check: it was
+compressed from the picture separately, not transcoded from `testorig.jpg`,
+and Pillow too reads the two up to 17 levels apart. Read by this decoder and
+by Pillow it differs by at most 3 levels, the same as any Huffman file does
+(see "Why it differs from Pillow by a few levels").

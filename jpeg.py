@@ -376,9 +376,7 @@ def encode(rgb, width, height, quality=75, subsample=True, optimize=False, grey=
 
 
 # Reading. Everything from here on trusts nothing in the file; see DOCS.md.
-REFUSED = {0xC3: "lossless (SOF3)",
-           0xC9: "arithmetic coded (SOF9)", 0xCA: "progressive arithmetic coded (SOF10)",
-           0xCB: "lossless arithmetic coded (SOF11)", 0xCC: "arithmetic coded (DAC)", 0xDC: "DNL marker"}
+REFUSED = {0xC3: "lossless (SOF3)", 0xCB: "lossless arithmetic coded (SOF11)", 0xDC: "DNL marker"}
 REFUSED.update({m: f"hierarchical (marker 0xFF{m:02X})" for m in (0xC5, 0xC6, 0xC7, 0xCD, 0xCE, 0xCF, 0xDE, 0xDF)})
 BYTE_BITS = [format(i, "08b") for i in range(256)]
 
@@ -595,10 +593,164 @@ def own_blocks(c, width, height, hmax, vmax):
 
 ZEROS = (0,) * 64
 
+# T.81 Table D.2, one entry per probability state: (Qe, next state after an LPS, next after an MPS,
+# whether an LPS swaps which symbol is more probable). 113 is libjpeg's fixed one-half, for signs.
+QE = [(0x5A1D, 1, 1, 1), (0x2586, 14, 2, 0), (0x1114, 16, 3, 0), (0x080B, 18, 4, 0), (0x03D8, 20, 5, 0),
+      (0x01DA, 23, 6, 0), (0x00E5, 25, 7, 0), (0x006F, 28, 8, 0), (0x0036, 30, 9, 0), (0x001A, 33, 10, 0),
+      (0x000D, 35, 11, 0), (0x0006, 9, 12, 0), (0x0003, 10, 13, 0), (0x0001, 12, 13, 0), (0x5A7F, 15, 15, 1),
+      (0x3F25, 36, 16, 0), (0x2CF2, 38, 17, 0), (0x207C, 39, 18, 0), (0x17B9, 40, 19, 0), (0x1182, 42, 20, 0),
+      (0x0CEF, 43, 21, 0), (0x09A1, 45, 22, 0), (0x072F, 46, 23, 0), (0x055C, 48, 24, 0), (0x0406, 49, 25, 0),
+      (0x0303, 51, 26, 0), (0x0240, 52, 27, 0), (0x01B1, 54, 28, 0), (0x0144, 56, 29, 0), (0x00F5, 57, 30, 0),
+      (0x00B7, 59, 31, 0), (0x008A, 60, 32, 0), (0x0068, 62, 33, 0), (0x004E, 63, 34, 0), (0x003B, 32, 35, 0),
+      (0x002C, 33, 9, 0), (0x5AE1, 37, 37, 1), (0x484C, 64, 38, 0), (0x3A0D, 65, 39, 0), (0x2EF1, 67, 40, 0),
+      (0x261F, 68, 41, 0), (0x1F33, 69, 42, 0), (0x19A8, 70, 43, 0), (0x1518, 72, 44, 0), (0x1177, 73, 45, 0),
+      (0x0E74, 74, 46, 0), (0x0BFB, 75, 47, 0), (0x09F8, 77, 48, 0), (0x0861, 78, 49, 0), (0x0706, 79, 50, 0),
+      (0x05CD, 48, 51, 0), (0x04DE, 50, 52, 0), (0x040F, 50, 53, 0), (0x0363, 51, 54, 0), (0x02D4, 52, 55, 0),
+      (0x025C, 53, 56, 0), (0x01F8, 54, 57, 0), (0x01A4, 55, 58, 0), (0x0160, 56, 59, 0), (0x0125, 57, 60, 0),
+      (0x00F6, 58, 61, 0), (0x00CB, 59, 62, 0), (0x00AB, 61, 63, 0), (0x008F, 61, 32, 0), (0x5B12, 65, 65, 1),
+      (0x4D04, 80, 66, 0), (0x412C, 81, 67, 0), (0x37D8, 82, 68, 0), (0x2FE8, 83, 69, 0), (0x293C, 84, 70, 0),
+      (0x2379, 86, 71, 0), (0x1EDF, 87, 72, 0), (0x1AA9, 87, 73, 0), (0x174E, 72, 74, 0), (0x1424, 72, 75, 0),
+      (0x119C, 74, 76, 0), (0x0F6B, 74, 77, 0), (0x0D51, 75, 78, 0), (0x0BB6, 77, 79, 0), (0x0A40, 77, 48, 0),
+      (0x5832, 80, 81, 1), (0x4D1C, 88, 82, 0), (0x438E, 89, 83, 0), (0x3BDD, 90, 84, 0), (0x34EE, 91, 85, 0),
+      (0x2EAE, 92, 86, 0), (0x299A, 93, 87, 0), (0x2516, 86, 71, 0), (0x5570, 88, 89, 1), (0x4CA9, 95, 90, 0),
+      (0x44D9, 96, 91, 0), (0x3E22, 97, 92, 0), (0x3824, 99, 93, 0), (0x32B4, 99, 94, 0), (0x2E17, 93, 86, 0),
+      (0x56A8, 95, 96, 1), (0x4F46, 101, 97, 0), (0x47E5, 102, 98, 0), (0x41CF, 103, 99, 0), (0x3C3D, 104, 100, 0),
+      (0x375E, 99, 93, 0), (0x5231, 105, 102, 0), (0x4C0F, 106, 103, 0), (0x4639, 107, 104, 0), (0x415E, 103, 99, 0),
+      (0x5627, 105, 106, 1), (0x50E7, 108, 107, 0), (0x4B85, 109, 103, 0), (0x5597, 110, 109, 0), (0x504F, 111, 107, 0),
+      (0x5A10, 110, 111, 1), (0x5522, 112, 109, 0), (0x59EB, 112, 111, 1), (0x5A1D, 113, 113, 0)]
 
-def read_scan(data, pos, body, frame, qt, huff, interval, coefs, progressive):
+
+class Arith:
+    # The decoder of T.81 Annex D as libjpeg runs it. A bin is a state number, plus 128 when the
+    # more probable symbol is 1. Past the end of the data it reads zeros, as the standard says.
+    def __init__(self, data):
+        self.data, self.pos, self.c, self.a, self.ct = data, 0, 0, 0, -16
+
+    def bit(self, bins, i):
+        while self.a < 0x8000:
+            self.ct -= 1
+            if self.ct < 0:
+                self.c = self.c << 8 | (self.data[self.pos] if self.pos < len(self.data) else 0)
+                self.pos += 1
+                self.ct += 8
+                if self.ct < 0:
+                    self.ct += 1
+                    if self.ct == 0:
+                        self.a = 0x8000  # the first two bytes are in; doubled to 0x10000 below
+            self.a <<= 1
+        sv = bins[i]
+        qe, lps, mps, switch = QE[sv & 127]
+        self.a -= qe
+        top = self.a << self.ct
+        if self.c >= top:
+            # The interval chosen is the one of size qe: the LPS, unless the MPS's part had shrunk below it.
+            self.c -= top
+            swap = self.a >= qe
+            self.a = qe
+        elif self.a < 0x8000:
+            swap = self.a < qe
+        else:
+            return sv >> 7
+        if swap:
+            bins[i] = (sv & 128 ^ switch << 7) | lps
+            return sv >> 7 ^ 1
+        bins[i] = sv & 128 | mps
+        return sv >> 7
+
+
+def arith_dc(dec, bins, ctx, s, lower, upper):
+    # A DC difference (F.2.4.1): zero or not, sign, magnitude category, then its bits. Which bins
+    # are used depends on the difference before (ctx[s]), sorted by DAC's limits L and U.
+    st = ctx[s]
+    if not dec.bit(bins, st):
+        ctx[s] = 0
+        return 0
+    sign = dec.bit(bins, st + 1)
+    st += 2 + sign
+    m = dec.bit(bins, st)
+    if m:
+        st = 20
+        while dec.bit(bins, st):
+            m <<= 1
+            if m == 0x8000:
+                raise ValueError("an arithmetic coded DC difference is too large")
+            st += 1
+    if m < (1 << lower) >> 1:
+        ctx[s] = 0
+    elif m > (1 << upper) >> 1:
+        ctx[s] = 12 + 4 * sign
+    else:
+        ctx[s] = 4 + 4 * sign
+    return -arith_bits(dec, bins, st + 14, m) if sign else arith_bits(dec, bins, st + 14, m)
+
+
+def arith_bits(dec, bins, st, m):
+    # The bits below the top one of a magnitude, each in the same bin, then one added (F.2.4.3).
+    v = m
+    while m := m >> 1:
+        if dec.bit(bins, st):
+            v |= m
+    return v + 1
+
+
+def arith_ac(dec, bins, fixed, blk, ss, se, al, kx):
+    # AC coefficients ss..se (F.2.4.2): before each, an end-of-block decision, then a zero-or-not one per
+    # coefficient until one is not; kx is DAC's K, where the magnitude bins change.
+    k = ss
+    while k <= se:
+        st = 3 * (k - 1)
+        if dec.bit(bins, st):
+            return
+        while not dec.bit(bins, st + 1):
+            st += 3
+            k += 1
+            if k > se:
+                raise ValueError("an arithmetic coded block has more coefficients than its band holds")
+        sign = dec.bit(fixed, 0)
+        st += 2
+        m = dec.bit(bins, st)
+        if m and dec.bit(bins, st):
+            m <<= 1
+            st = 189 if k <= kx else 217
+            while dec.bit(bins, st):
+                m <<= 1
+                if m == 0x8000:
+                    raise ValueError("an arithmetic coded coefficient is too large")
+                st += 1
+        v = arith_bits(dec, bins, st + 14, m)
+        blk[k] = (-v if sign else v) << al
+        k += 1
+
+
+def arith_refine(dec, bins, fixed, blk, ss, se, al):
+    # A refinement pass (G.1.3.3): known coefficients get one more bit, and new ones of size one
+    # arrive, with an end-of-block decision only past the last coefficient known before.
+    p1, m1 = 1 << al, -1 << al
+    last = next((k for k in range(se, 0, -1) if blk[k]), 0)
+    k = ss
+    while k <= se:
+        st = 3 * (k - 1)
+        if k > last and dec.bit(bins, st):
+            return
+        while True:
+            if blk[k]:
+                if dec.bit(bins, st + 2):
+                    blk[k] += m1 if blk[k] < 0 else p1
+                break
+            if dec.bit(bins, st + 1):
+                blk[k] = m1 if dec.bit(fixed, 0) else p1
+                break
+            st += 3
+            k += 1
+            if k > se:
+                raise ValueError("an arithmetic coded block has more coefficients than its band holds")
+        k += 1
+
+
+def read_scan(data, pos, body, frame, qt, huff, interval, coefs, progressive, arith=None):
     # Decodes one scan into coefs (per component: its quantization table and blocks, zigzag order)
     # and returns where the next marker starts. DOCS.md, "Progressive files", has the four kinds.
+    # arith holds DAC's conditioning for an arithmetic coded file, and is None for a Huffman one.
     width, height, comps = frame
     ns = body[0] if body else 0
     if not ns or len(body) != 4 + 2 * ns:
@@ -618,9 +770,9 @@ def read_scan(data, pos, body, frame, qt, huff, interval, coefs, progressive):
             raise ValueError(f"the scan names component {body[i]}, which is not in the frame or is named twice")
         td, ta = body[i + 1] >> 4, body[i + 1] & 15
         needed = [("quantization", qt, c["tq"], c["tq"])]
-        if ss == 0 and not ah:
+        if ss == 0 and not ah and arith is None:
             needed.append(("DC Huffman", huff, (0, td), td))
-        if se:
+        if se and arith is None:
             needed.append(("AC Huffman", huff, (1, ta), ta))
         for kind, table, key, slot in needed:
             if key not in table:
@@ -630,7 +782,7 @@ def read_scan(data, pos, body, frame, qt, huff, interval, coefs, progressive):
         # The quantization table is taken when a component is first seen, as libjpeg does.
         # Blocks are made only when the data reaches them, so a header cannot ask for memory alone.
         q, blocks = coefs.setdefault(c["id"], (qt[c["tq"]], {}))
-        scan.append((c, huff.get((0, td)), huff.get((1, ta)), blocks, mcux * c["h"]))
+        scan.append((c, *((td, ta) if arith is not None else (huff.get((0, td)), huff.get((1, ta)))), blocks, mcux * c["h"]))
     if ns > 1:
         # Interleaved: an MCU holds each component's h by v blocks in turn.
         total = mcux * mcuy
@@ -648,6 +800,29 @@ def read_scan(data, pos, body, frame, qt, huff, interval, coefs, progressive):
         raise ValueError(f"expected {-(-total // interval) - 1} restart markers in order, found {len(rsts)} numbered {rsts[:8]}")
     unit = 0
     for piece in pieces:
+        if arith is not None:
+            # Every restart starts the coder and its statistics again, as the DC predictions are.
+            dec, ctx, pred, fixed = Arith(piece), [0] * ns, [0] * ns, [113]
+            dc_bins = {sc[1]: [0] * 64 for sc in scan}
+            ac_bins = {sc[2]: [0] * 256 for sc in scan}
+            for _ in range(min(interval, total - unit)):
+                for s, b in units(unit):
+                    _, td, ta, blocks, _ = scan[s]
+                    blk = blocks.setdefault(b, [0] * 64)
+                    if ss == 0 and not ah:
+                        pred[s] += arith_dc(dec, dc_bins[td], ctx, s, *arith.get((0, td), (0, 1)))
+                        blk[0] = pred[s] << al
+                        if se:
+                            arith_ac(dec, ac_bins[ta], fixed, blk, 1, se, 0, arith.get((1, ta), 5))
+                    elif ss == 0:
+                        if dec.bit(fixed, 0):
+                            blk[0] |= 1 << al
+                    elif not ah:
+                        arith_ac(dec, ac_bins[ta], fixed, blk, ss, se, al, arith.get((1, ta), 5))
+                    else:
+                        arith_refine(dec, ac_bins[ta], fixed, blk, ss, se, al)
+                unit += 1
+            continue
         bits = "".join(map(BYTE_BITS.__getitem__, piece))
         end = len(bits)
         # Zeros past the end (as libjpeg does) always read as some code, so running out is caught
@@ -784,7 +959,7 @@ def decode(data, upright=False):
     orientation = None
     if data[:2] != b"\xff\xd8":
         raise ValueError("not a JPEG: it does not start with SOI (FF D8)")
-    qt, huff, frame, coefs, scans, interval, pos, transform = {}, {}, None, {}, 0, 0, 2, 1
+    qt, huff, arith, frame, coefs, scans, interval, pos, transform = {}, {}, {}, None, {}, 0, 0, 2, 1
     while True:
         if pos >= len(data):
             raise ValueError("the file ends before the EOI marker")
@@ -799,8 +974,8 @@ def decode(data, upright=False):
         if marker == 0xD9:
             break
         if marker in REFUSED:
-            raise ValueError(f"{REFUSED[marker]} JPEGs are not supported, only baseline (SOF0) and progressive (SOF2)")
-        if marker not in (0xC0, 0xC1, 0xC2, 0xC4, 0xDA, 0xDB, 0xDD, 0xFE) and not 0xE0 <= marker <= 0xEF:
+            raise ValueError(f"{REFUSED[marker]} JPEGs are not supported, only sequential and progressive DCT ones")
+        if marker not in (0xC0, 0xC1, 0xC2, 0xC4, 0xC9, 0xCA, 0xCC, 0xDA, 0xDB, 0xDD, 0xFE) and not 0xE0 <= marker <= 0xEF:
             raise ValueError(f"unknown marker 0xFF{marker:02X} at byte {start}")
         n = int.from_bytes(data[pos:pos + 2], "big")
         if n < 2 or pos + n > len(data):
@@ -816,15 +991,26 @@ def decode(data, upright=False):
             if len(body) != 2:
                 raise ValueError("the DRI segment has the wrong length")
             interval = int.from_bytes(body, "big")
-        elif marker in (0xC0, 0xC1, 0xC2):
+        elif marker == 0xCC:
+            # DAC: per table, DC's L and U (low and high nibble) or AC's K. Unset ones keep 0, 1 and 5.
+            if len(body) % 2:
+                raise ValueError("the DAC segment has the wrong length")
+            for i in range(0, len(body), 2):
+                tc, tb, cs = body[i] >> 4, body[i] & 15, body[i + 1]
+                if tc > 1 or tb > 3 or (tc == 0 and cs & 15 > cs >> 4) or (tc == 1 and not 1 <= cs <= 63):
+                    raise ValueError(f"the DAC segment's entry {body[i]:02X} {cs:02X} is not valid")
+                arith[tc, tb] = cs if tc else (cs & 15, cs >> 4)
+        elif marker in (0xC0, 0xC1, 0xC2, 0xC9, 0xCA):
             # SOF1 (extended) differs from baseline only in allowing 12 bits, which read_frame refuses.
+            # SOF9 and SOF10 are SOF1 and SOF2 with arithmetic coding in place of Huffman.
             if frame:
                 raise ValueError("the file has two frames")
-            frame, progressive = read_frame(body), marker == 0xC2
+            frame, progressive = read_frame(body), marker in (0xC2, 0xCA)
+            coding = arith if marker in (0xC9, 0xCA) else None
         elif marker == 0xDA:
             if frame is None:
                 raise ValueError("a scan comes before the frame header")
-            pos = read_scan(data, pos, body, frame, qt, huff, interval, coefs, progressive)
+            pos = read_scan(data, pos, body, frame, qt, huff, interval, coefs, progressive, coding)
             scans += 1
     if not scans:
         raise ValueError("the file has no scan (SOS)")

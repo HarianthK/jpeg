@@ -239,7 +239,8 @@ for label, image in IMAGES.items():
         scores = []
         for quality in ((25, 50, 75, 90) if big else QUALITIES):
             data = jpeg.encode(pixels, image.width, image.height, quality, subsample)
-            default_files.update(data)
+            if not label.startswith("trace-rays"):  # that one is another repo's file, and changes
+                default_files.update(data)
             where = f"{label}, q{quality}, {'4:2:0' if subsample else '4:4:4'}"
             try:
                 ours = theirs_decode(data)
@@ -283,7 +284,7 @@ for label, image in IMAGES.items():
             check(all(a < b for a, b in zip(scores, scores[1:])), f"{label}: PSNR does not rise with quality: {scores}")
 
 # Without --optimize every file is byte for byte what the encoder wrote before the option existed.
-check(default_files.hexdigest() == "93ed0e5b179ad8802d5d0a028e01bdfddfc48a8081c20b96ad3baad0cb035715",
+check(default_files.hexdigest() == "9e22cdf411e46f0ed3d125ac7da5b36f7a7e294e4acbb86c39121d051085f3c0",
       "default output changed")
 print(f"{'image':26} {'q':>3} {'sub':5} {'ours':>7} {'Pillow':>7} {'ours dB':>8} {'Pillow dB':>9}")
 for label, quality, subsample, mine, other, p1, p2 in rows:
@@ -457,7 +458,7 @@ refused(small[:scan_start] + b"\xff\x00" * 4 + small[scan_start + 8:], "a code t
 patched = bytearray(small)
 patched[at[0xC0] + 1] = 0xC1
 check(our_decode(bytes(patched), "SOF1") == our_decode(small, "SOF0"), "an 8-bit SOF1 file decoded differently from the same file as SOF0")
-for marker, words in ((0xC9, "arithmetic"), (0xC3, "lossless"), (0xC2, "progressive")):
+for marker, words in ((0xCB, "lossless arithmetic"), (0xC3, "lossless"), (0xC2, "progressive")):
     patched = bytearray(small)
     patched[at[0xC0] + 1] = marker
     refused(bytes(patched), f"SOF0 marked 0xFF{marker:02X}", words)
@@ -637,6 +638,47 @@ for n in range(200):
     except Exception as e:
         check(False, f"progressive flip {n}: raised {e!r}")
 print(f"broken progressive scans refused; 200 bit-flipped files: {decoded} decoded, the rest refused with ValueError")
+
+# Arithmetic coding: the *_arith* files in scans/ are jpegtran -arithmetic of their sources, checked above
+# with the rest. Here, DAC entries out of range are refused, and damaged arithmetic data never crashes.
+ari = open(os.path.join(SCANS, "420_arith_successive.jpg"), "rb").read()
+dac = ari.index(b"\xff\xcc")
+check(ari[dac + 1] == 0xCC and int.from_bytes(ari[dac + 2:dac + 4], "big") > 2, "the arithmetic file has no DAC segment to patch")
+for entry, why in ((b"\x10\x00", "AC K of 0"), (b"\x10\x40", "AC K of 64"), (b"\x00\x12", "DC L above U"), (b"\x20\x05", "table class 2"),
+                   (b"\x04\x10", "table 4")):
+    refused(ari[:dac + 4] + entry + ari[dac + 6:], f"DAC with {why}", "DAC")
+refused(ari[:dac + 2] + b"\x00\x05\x10" + ari[dac + 5:], "a DAC of odd length", "DAC")
+# jpegtran writes DAC even with the values a reader defaults to, so without any DAC each file reads the same.
+for name in sorted(os.listdir(SCANS)):
+    if "_arith" in name:
+        data = open(os.path.join(SCANS, name), "rb").read()
+        bare = data
+        while b"\xff\xcc" in bare:
+            at = bare.index(b"\xff\xcc")
+            bare = bare[:at] + bare[at + 2 + int.from_bytes(bare[at + 2:at + 4], "big"):]
+        check(bare != data and our_decode(bare, name + " without DAC") == our_decode(data, name), f"{name} without DAC read differently")
+# DAC set to what it already defaults to changes nothing; set to other values it changes how the data reads.
+ac_entry = ari.index(b"\x10\x05", dac)
+same = jpeg.decode(ari)
+check(jpeg.decode(ari[:ac_entry] + b"\x10\x05" + ari[ac_entry + 2:]) == same, "rewriting DAC's defaults changed the pixels")
+try:
+    check(jpeg.decode(ari[:ac_entry] + b"\x10\x01" + ari[ac_entry + 2:]) != same, "DAC's K was ignored")
+except ValueError:
+    pass
+fuzz, decoded = random.Random(13), 0
+for n in range(200):
+    broken = bytearray(ari)
+    for _ in range(fuzz.choice((1, 2, 4))):
+        broken[fuzz.randrange(2, len(broken))] ^= 1 << fuzz.randrange(8)
+    try:
+        width, height, rgb = jpeg.decode(bytes(broken))
+        check(len(rgb) == 3 * width * height, f"arithmetic flip {n}: {width}x{height} but {len(rgb)} bytes")
+        decoded += 1
+    except ValueError:
+        pass
+    except Exception as e:
+        check(False, f"arithmetic flip {n}: raised {e!r}")
+print(f"arithmetic files: bad DAC entries refused; 200 bit-flipped files: {decoded} decoded, the rest refused with ValueError")
 
 # The progressive encoder sends the very same coefficients in several scans, so Pillow (libjpeg)
 # and our decoder must both read it as exactly the pixels of the baseline file, at every layout.

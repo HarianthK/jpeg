@@ -53,12 +53,16 @@ Reading, with `decode(data)` or `-d`:
   for all eight values, the same way Pillow's `exif_transpose` does; `-d` always
   writes it upright, since a PNG has nowhere to keep the tag. A broken EXIF
   segment is ignored, not refused, because the picture itself is fine.
+- Arithmetic coded files too, sequential (SOF9) and progressive (SOF10), with
+  their DAC conditioning: the other entropy coder the standard allows, which
+  libjpeg-turbo reads and writes (`jpegtran -arithmetic`) and most programs
+  never do. Each is decoded to exactly the pixels of the Huffman file
+  jpegtran made it from.
 - Huffman decoding through a 16-bit lookup table, zigzag undone, the inverse
   DCT, libjpeg's "fancy" chroma upsampling (3/4 of the nearer sample, 1/4 of
   the next), and the JFIF equations back to RGB, clamped to 0..255.
-- Everything in the file is checked before it is used. A broken file, or an
-  arithmetic coded, lossless or 12-bit one, raises `ValueError` with the
-  reason.
+- Everything in the file is checked before it is used. A broken file, or a
+  lossless, hierarchical or 12-bit one, raises `ValueError` with the reason.
 
 ## How it compares
 
