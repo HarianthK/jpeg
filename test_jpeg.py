@@ -680,6 +680,18 @@ for n in range(200):
         check(False, f"arithmetic flip {n}: raised {e!r}")
 print(f"arithmetic files: bad DAC entries refused; 200 bit-flipped files: {decoded} decoded, the rest refused with ValueError")
 
+def scan_headers(data):
+    # Each SOS segment's components, then Ss, Se and Ah << 4 | Al; table numbers are the encoder's own choice.
+    # 0xFF 0xDA cannot occur inside scan data, where every 0xFF is followed by 0x00 or a restart.
+    out, at = [], data.find(b"\xff\xda")
+    while at != -1:
+        length = int.from_bytes(data[at + 2:at + 4], "big")
+        body = data[at + 4:at + 2 + length]
+        out.append(tuple(body[1:1 + 2 * body[0]:2]) + tuple(body[-3:]))
+        at = data.find(b"\xff\xda", at + 2 + length)
+    return out
+
+
 # The progressive encoder sends the very same coefficients in several scans, so Pillow (libjpeg)
 # and our decoder must both read it as exactly the pixels of the baseline file, at every layout.
 sizes = []
@@ -691,9 +703,29 @@ for label, image in IMAGES.items():
         check(theirs_decode(prog).tobytes() == theirs_decode(base).tobytes(), f"{label} {opts}: Pillow read our progressive file differently")
         check(our_decode(prog, label) == our_decode(base, label), f"{label} {opts}: our decoder read our progressive file differently")
         sizes.append((label, opts, len(base), len(prog)))
+        refined = jpeg.encode(*args, progressive=True, refine=True, **opts)
+        check(theirs_decode(refined).tobytes() == theirs_decode(base).tobytes(), f"{label} {opts}: Pillow read our refined file differently")
+        check(our_decode(refined, label) == our_decode(base, label), f"{label} {opts}: our decoder read our refined file differently")
+        # The same scans as libjpeg's default script, which Pillow's progressive files use.
+        theirs = pillow_jpeg(image.convert("L") if opts.get("grey") else image, quality=75, progressive=True,
+                             **({} if opts.get("grey") else {"subsampling": 0 if "subsample" in opts else 2}))
+        check(scan_headers(refined) == scan_headers(theirs), f"{label} {opts}: scans {scan_headers(refined)} are not libjpeg's")
+        check(any(h[-1] >> 4 for h in scan_headers(refined)), f"{label} {opts}: no refinement scan")
 try:
     jpeg.encode(b"\x00" * 3, 1, 1, progressive=True, restart=1)
     check(False, "progressive with restart markers was accepted")
+except ValueError:
+    pass
+# A refinement band whose only nonzero coefficient, at 20, was nonzero already: its bit waits for the end
+# of band, and the 19 zeros before it need no ZRL, since no newly nonzero coefficient follows them.
+symbols = []
+recorder = type("Recorder", (dict,), {"__missing__": lambda self, sym: symbols.append(sym) or (0, 1)})()
+quiet = type("Quiet", (), {"write": lambda self, value, n: None})()
+jpeg.refine_band(quiet, recorder, [[0] * 20 + [3] + [0] * 43], 1, 63, 0)
+check(symbols == [0x00], f"refining an old coefficient after 19 zeros wrote symbols {symbols}, not one end of band")
+try:
+    jpeg.encode(b"\x00" * 3, 1, 1, refine=True)
+    check(False, "refine without progressive was accepted")
 except ValueError:
     pass
 render = [(b, p) for label, opts, b, p in sizes if "render" in label and not opts]

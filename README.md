@@ -34,6 +34,13 @@ Huffman coded.
 - `--progressive` (or `progressive=True`): the same coefficients in five scans
   (three in greyscale) instead of one, so a viewer can show the whole picture blurred first and
   sharpen it. Each scan gets its own Huffman table. See DOCS.md.
+- `--refine` with it (or `refine=True`): libjpeg's own progressive script,
+  ten scans, where the first ones hold back the low bits of every
+  coefficient and later ones send them a bit at a time (successive
+  approximation). Its scans are the ones Pillow's progressive files have, and
+  the files come out within 1% of Pillow's size. A rough first look comes
+  sooner, but on the render the whole file is 2% bigger than the five plain
+  scans at quality 75, and up to 12% at quality 25, so it is not the default.
 - `--restart N` (or `restart=N`): a DRI segment, and every N MCUs the byte is
   ended with RST0 to RST7 in turn and DC starts again from zero, so a damaged
   byte spoils only the stretch up to the next marker. The pixels do not change.
@@ -134,7 +141,7 @@ lowest is 51.90 dB, and a flat colour at 4:4:4 comes out exactly equal. Restart 
 
 ## Running it
 
-    python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize] [--progressive] [--restart N]
+    python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize] [--progressive [--refine]] [--restart N]
     python jpeg.py -d IN.jpg [-o OUT.png]
     python test_jpeg.py
 

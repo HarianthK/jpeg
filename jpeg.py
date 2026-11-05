@@ -220,9 +220,9 @@ def encode_block(w, zz, prev_dc, dc, ac):
     return zz[0]
 
 
-def ac_band(w, ac, zzs, ss, se):
-    # One component's coefficients ss to se in every block. Blocks with nothing left in the band are
-    # sent as one end-of-band run (G.1.2.2): symbol r << 4, then r more bits of the count.
+def ac_band(w, ac, zzs, ss, se, al=0):
+    # One component's coefficients ss to se in every block, less their al low bits. Blocks with nothing
+    # left in the band are sent as one end-of-band run (G.1.2.2): symbol r << 4, then r more bits of the count.
     eobrun = 0
 
     def end_run():
@@ -233,7 +233,7 @@ def ac_band(w, ac, zzs, ss, se):
             w.write(eobrun - (1 << r), r)
             eobrun = 0
     for zz in zzs:
-        band = zz[ss:se + 1]
+        band = [v >> al if v >= 0 else -(-v >> al) for v in zz[ss:se + 1]]
         if any(band):
             end_run()
             run = 0
@@ -256,6 +256,53 @@ def ac_band(w, ac, zzs, ss, se):
     end_run()
 
 
+def refine_band(w, ac, zzs, ss, se, al):
+    # Bit al of coefficients ss to se, as libjpeg's encode_mcu_AC_refine: a coefficient that becomes
+    # nonzero is a (zeros before, 1) symbol and its sign; one already nonzero sends its bit raw. DOCS.md.
+    eobrun, pending = 0, []  # pending: the raw bits of the blocks in the end-of-band run
+
+    def end_run():
+        nonlocal eobrun, pending
+        if eobrun:
+            r = eobrun.bit_length() - 1
+            w.write(*ac[r << 4])
+            w.write(eobrun - (1 << r), r)
+            for bit in pending:
+                w.write(bit, 1)
+            eobrun, pending = 0, []
+    for zz in zzs:
+        mags = [abs(v) >> al for v in zz[ss:se + 1]]
+        last_new = max((k for k, m in enumerate(mags) if m == 1), default=-1)
+        run, bits = 0, []
+        for k, m in enumerate(mags):
+            if m == 0:
+                run += 1
+                continue
+            while run > 15 and k <= last_new:
+                end_run()
+                w.write(*ac[0xF0])
+                run -= 16
+                for bit in bits:
+                    w.write(bit, 1)
+                bits = []
+            if m > 1:
+                bits.append(m & 1)
+                continue
+            end_run()
+            w.write(*ac[(run << 4) | 1])
+            w.write(1 if zz[ss + k] > 0 else 0, 1)
+            for bit in bits:
+                w.write(bit, 1)
+            run, bits = 0, []
+        if run or bits:
+            eobrun += 1
+            pending += bits
+            # libjpeg caps the buffered bits at 1000 less a block's worth, so a decoder's buffer stays small.
+            if eobrun == 0x7FFF or len(pending) > 937:
+                end_run()
+    end_run()
+
+
 def coded(scan, n):
     # A scan written twice: once to count its symbols, then with n Huffman tables built from them.
     tallies = [Tally() for _ in range(n)]
@@ -267,22 +314,45 @@ def coded(scan, n):
     return tables, bytes(w.out)
 
 
-def progressive_scans(units, grids):
-    # Spectral selection only: every DC in one interleaved scan, then each component's AC bands.
-    def dc_scan(w, *dc):
-        prev = [0, 0, 0]
-        for c, zz in units:
-            s, bits = category(zz[0] - prev[c])
-            w.write(*dc[min(c, 1)][s])
-            w.write(bits, s)
-            prev[c] = zz[0]
-    ids = range(len(grids))
-    tables, data = coded(dc_scan, min(len(grids), 2))
-    out = [segment(0xFFC4, b"".join(bytes([slot]) + bytes(t[0]) + t[1] for slot, t in zip((0x00, 0x01), tables))),
-           segment(0xFFDA, bytes([len(grids)]) + b"".join(bytes([c + 1, min(c, 1) << 4]) for c in ids) + bytes([0, 0, 0])), data]
-    for c, ss, se in ([(0, 1, 5), (0, 6, 63)] + [(c, 1, 63) for c in ids if c]):
-        (table,), data = coded(lambda w, ac: ac_band(w, ac, grids[c], ss, se), 1)
-        out += [segment(0xFFC4, bytes([0x10]) + bytes(table[0]) + table[1]), segment(0xFFDA, bytes([1, c + 1, 0x00, ss, se, 0])), data]
+# Scans as components, first and last coefficient, then Ah and Al: the bits already sent and those
+# still held back. SPECTRAL sends every bit at once; REFINE is libjpeg's jpeg_simple_progression.
+SPECTRAL = [((0, 1, 2), 0, 0, 0, 0), ((0,), 1, 5, 0, 0), ((0,), 6, 63, 0, 0), ((1,), 1, 63, 0, 0), ((2,), 1, 63, 0, 0)]
+REFINE = [((0, 1, 2), 0, 0, 0, 1), ((0,), 1, 5, 0, 2), ((2,), 1, 63, 0, 1), ((1,), 1, 63, 0, 1), ((0,), 6, 63, 0, 2),
+          ((0,), 1, 63, 2, 1), ((0, 1, 2), 0, 0, 1, 0), ((2,), 1, 63, 1, 0), ((1,), 1, 63, 1, 0), ((0,), 1, 63, 1, 0)]
+
+
+def progressive_scans(units, grids, script):
+    # Each scan in the script, with Huffman tables built for it; greyscale keeps the scans of component 0.
+    out = []
+    for comps, ss, se, ah, al in script:
+        comps = [c for c in comps if c < len(grids)]
+        if not comps:
+            continue
+        if ss == 0 and ah:
+            # A DC refinement is one raw bit a block, with no Huffman table.
+            w = BitWriter()
+            for c, zz in units:
+                w.write(zz[0] >> al & 1, 1)
+            w.flush()
+            tables, data = [], bytes(w.out)
+        elif ss == 0:
+            def dc_scan(w, *dc):
+                prev = [0, 0, 0]
+                for c, zz in units:
+                    v = zz[0] >> al
+                    s, bits = category(v - prev[c])
+                    w.write(*dc[min(c, 1)][s])
+                    w.write(bits, s)
+                    prev[c] = v
+            tables, data = coded(dc_scan, min(len(grids), 2))
+        else:
+            band = refine_band if ah else ac_band
+            tables, data = coded(lambda w, ac: band(w, ac, grids[comps[0]], ss, se, al), 1)
+        if tables:
+            cls = 0x10 if ss else 0x00
+            out.append(segment(0xFFC4, b"".join(bytes([cls | slot]) + bytes(t[0]) + t[1] for slot, t in enumerate(tables))))
+        selectors = b"".join(bytes([c + 1, 0 if ss else min(c, 1) << 4]) for c in comps)
+        out += [segment(0xFFDA, bytes([len(comps)]) + selectors + bytes([ss, se, ah << 4 | al])), data]
     return b"".join(out)
 
 
@@ -290,13 +360,16 @@ def segment(marker, body):
     return struct.pack(">HH", marker, len(body) + 2) + body
 
 
-def encode(rgb, width, height, quality=75, subsample=True, optimize=False, grey=False, restart=0, progressive=False):
+def encode(rgb, width, height, quality=75, subsample=True, optimize=False, grey=False, restart=0, progressive=False,
+           refine=False):
     # rgb is width * height * 3 bytes, row by row. Returns the bytes of a JFIF file.
     # optimize counts this picture's symbols first and builds its own Huffman tables from them.
     if not 0 <= restart < 65536:
         raise ValueError("restart is 0 to 65535 MCUs")
     if progressive and restart:
         raise ValueError("restart markers are not written in progressive files")
+    if refine and not progressive:
+        raise ValueError("refine is a progressive script, so it needs progressive")
     if not (0 < width < 65536 and 0 < height < 65536) or len(rgb) != width * height * 3:
         raise ValueError("rgb must be width * height * 3 bytes, each side 1 to 65535")
     luma_q, chroma_q = quant_tables(quality)
@@ -363,7 +436,7 @@ def encode(rgb, width, height, quality=75, subsample=True, optimize=False, grey=
         sos = bytes([3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0])
     head = [b"\xff\xd8", segment(0xFFE0, b"JFIF\0\x01\x01\x00" + struct.pack(">HHBB", 1, 1, 0, 0)), segment(0xFFDB, dqt)]
     if progressive:
-        return b"".join(head + [segment(0xFFC2, sof), progressive_scans(units, grids), b"\xff\xd9"])
+        return b"".join(head + [segment(0xFFC2, sof), progressive_scans(units, grids, REFINE if refine else SPECTRAL), b"\xff\xd9"])
     return b"".join(head + [
         segment(0xFFC0, sof),
         segment(0xFFC4, b"".join(bytes([tc_th]) + bytes(t[0]) + t[1] for tc_th, t in
@@ -1022,7 +1095,7 @@ if __name__ == "__main__":
     argv = sys.argv[1:]
     args = [a for i, a in enumerate(argv) if not a.startswith("-") and (i == 0 or argv[i - 1] not in ("-o", "-q", "--restart"))]
     if not args:
-        sys.exit("usage: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize] [--progressive] [--restart N]\n"
+        sys.exit("usage: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize] [--progressive [--refine]] [--restart N]\n"
                  "       python jpeg.py -d IN.jpg [-o OUT.png]")
     from PIL import Image  # only to read or write the PNG; the JPEG is all this file
     source = args[0]
@@ -1041,6 +1114,7 @@ if __name__ == "__main__":
     image = Image.open(source).convert("RGB")
     packed = encode(image.tobytes(), image.width, image.height, quality, subsample="--444" not in argv,
                     optimize="--optimize" in argv, grey="--grey" in argv, progressive="--progressive" in argv,
+                    refine="--refine" in argv,
                     restart=int(argv[argv.index("--restart") + 1]) if "--restart" in argv else 0)
     open(out, "wb").write(packed)
     raw = image.width * image.height * 3

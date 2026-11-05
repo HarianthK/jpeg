@@ -506,14 +506,73 @@ thousand blocks in a row costs one symbol and ten bits.
 
 On the render at quality 75 that comes to 17,215 bytes against 17,350 for an
 optimized baseline file, 0.8 % smaller. Tiny pictures grow instead, since every
-scan carries a table of its own. Successive approximation, sending the high
-bits of every coefficient first and refining them later, would save more and
-is the next step.
+scan carries a table of its own. I expected successive approximation, below,
+to save more. It does not.
 
 Breakages: coefficient 6 left out of both bands fails 30 checks, scanning the
 MCU padding fails 4, and a run size one too big fails 42. Sending the run count
 whole instead of less its top bit fails nothing, and is no bug: the bit writer
 keeps only the low r bits, and a count of r bits' size always has 2^r on top.
+
+### Successive approximation, which costs bytes
+
+`refine=True` writes libjpeg's default script, `jpeg_simple_progression`: all
+DC less its low bit, luma 1 to 5 and 6 to 63 less two bits, chroma 1 to 63
+less one, then luma's second bit, then the last bit of everything. A first
+scan with Al held back sends each coefficient's magnitude shifted right, sign
+kept; DC is shifted arithmetically instead, as the standard says, so -3
+becomes -2, not -1. A DC refinement scan is one raw bit a block, with no
+Huffman table at all.
+
+AC refinement is the hard part, and follows libjpeg's `encode_mcu_AC_refine`.
+In a band some coefficients are already nonzero from earlier scans and some
+become nonzero now. Only the new ones get Huffman symbols, a run of zeros and
+a size that is always 1, then the sign. The old ones send their next bit
+raw, but not where they stand: their bits wait in a buffer and go out right
+after the next symbol. That includes an end-of-band run, so the bits of every
+block in the run wait until the run is written. libjpeg caps that buffer at
+937 bits, so a decoder's stays small, and so does this. A run of sixteen
+zeros is only written if a new coefficient follows it in the block; zeros
+after the last new one are covered by the end of band.
+
+The check is the progressive one: Pillow and our decoder must read every
+refined file as exactly the pixels of the baseline file, for every test
+picture at 4:2:0, 4:4:4 and greyscale. On top of that, each file's scans, by
+component, band and bits, must equal the scans in Pillow's own progressive
+file of the same picture, since Pillow's encoder is libjpeg's.
+
+The size, on the ray tracer's render, optimized tables throughout:
+
+| quality | layout | baseline | five scans | refined | Pillow progressive |
+| --- | --- | --- | --- | --- | --- |
+| 25 | 4:2:0 | 7,916 | 7,832 | 8,247 | 8,288 |
+| 25 | 4:4:4 | 9,377 | 8,851 | 9,888 | 9,936 |
+| 50 | 4:2:0 | 12,336 | 12,272 | 12,730 | 12,782 |
+| 75 | 4:2:0 | 18,489 | 18,332 | 18,653 | 18,813 |
+| 75 | 4:4:4 | 21,297 | 21,091 | 21,896 | 22,128 |
+| 90 | 4:2:0 | 30,956 | 30,526 | 30,537 | 31,055 |
+
+Refined files are within 1% of libjpeg's, and always a little
+smaller, so the encoding matches. But they are bigger than the five plain
+scans everywhere, by up to 12% at quality 25 in 4:4:4, and close to even only
+at quality 90. Each refinement scan pays for its own end-of-band runs and
+tables, and the raw correction bits do not compress at all. What it buys is
+how soon the picture can be shown: after the first five scans every
+coefficient has arrived, short only its last bit or two. So `progressive=True`
+stays as it was, byte for byte, and the refined script is the option.
+
+Nine breakages fail the test: the sign of a new coefficient inverted, the
+buffered bits of an end-of-band run dropped, a block's bits not sent after
+its new coefficient, Al ignored in a first AC scan, negative AC values
+shifted by floor instead of by magnitude, the wrong DC bit refined, Al
+ignored in the first DC scan, and Cb sent before Cr. The ninth, writing a
+sixteen-zero symbol where no new coefficient follows, still decodes to the
+same pixels and costs only a few bytes, so nothing caught it until a test fed
+one band to `refine_band` and checked that it wrote a single end of band.
+The first run of these breakages reported every one caught, all on the same
+11 checks: the script had started the test with another Python on the PATH,
+whose older Pillow cannot write restart markers. Run with the same
+interpreter, the counts above are each breakage's own.
 
 ### Why it differs from Pillow by a few levels
 
@@ -654,8 +713,7 @@ added, because Pillow always puts its IFD at byte 8.
 
 ## What it does not do
 
-The encoder writes no EXIF, and its progressive files use spectral selection
-only, no successive approximation. The decoder refuses
+The encoder writes no EXIF. The decoder refuses
 lossless, hierarchical and 12-bit files (8-bit extended SOF1 files are read, and so are arithmetic coded ones),
 sampling other than 1x or 2x the chroma (4:1:1), and four components (CMYK). It ignores ICC profiles. A file with
 no JFIF or Adobe segment and components named R, G and B is read as YCbCr,
