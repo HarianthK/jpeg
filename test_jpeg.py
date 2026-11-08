@@ -431,6 +431,22 @@ def segments(data):
     return found
 
 
+# Without the Adobe segment libjpeg goes by the component ids, R, G and B; a JFIF segment means YCbCr.
+JFIF = b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+for label in ("gradient 33x21", "colour stripes 48x32"):
+    rgb = pillow_jpeg(IMAGES[label], quality=75, keep_rgb=True)
+    adobe = segments(rgb)[0xEE]
+    bare = rgb[:adobe] + rgb[adobe + 2 + int.from_bytes(rgb[adobe + 2:adobe + 4], "big"):]
+    check(0xEE not in segments(bare) and bare[segments(bare)[0xC0] + 10:][:7:3] == b"RGB", f"{label}: not an R, G, B file without Adobe")
+    against_pillow(bare, f"{label}, q75, 4:4:4, ids R G B, no Adobe")
+    against_pillow(rgb[:2] + JFIF + rgb[2:], f"{label}, q75, 4:4:4, ids R G B, JFIF and Adobe")
+    against_pillow(bare[:2] + JFIF + bare[2:], f"{label}, q75, 4:4:4, ids R G B, JFIF")
+    check(rgb[adobe + 15] == 0, f"{label}: Pillow's Adobe transform is not 0")
+    against_pillow(rgb[:adobe + 15] + b"\x01" + rgb[adobe + 16:], f"{label}, q75, 4:4:4, ids R G B, Adobe says YCbCr")
+    ycc = pillow_jpeg(IMAGES[label], quality=75, subsampling=0)
+    check(ycc[2:4] == b"\xff\xe0", f"{label}: Pillow's file does not start with JFIF")
+    against_pillow(ycc[:2] + ycc[2 + 2 + int.from_bytes(ycc[4:6], "big"):], f"{label}, q75, 4:4:4, no JFIF")
+
 small = pillow_jpeg(IMAGES["noise 17x9"], quality=75)
 at = segments(small)
 # A lone component is never interleaved, so marking it 2x2 must change nothing; libjpeg agrees.

@@ -49,8 +49,10 @@ Huffman coded.
 Reading, with `decode(data)` or `-d`:
 
 - Baseline sequential files (SOF0) and progressive ones (SOF2), 8-bit,
-  greyscale or YCbCr at 4:4:4, 4:2:2, 4:2:0 or 4:4:0, and RGB files marked by
-  an Adobe segment. A file may send its components in one scan or one each.
+  greyscale or YCbCr at 4:4:4, 4:2:2, 4:2:0 or 4:4:0, and RGB files. Which of
+  YCbCr and RGB a file holds is guessed as libjpeg guesses it: a JFIF segment
+  means YCbCr, then an Adobe segment's transform decides, then components
+  named R, G and B mean RGB. A file may send its components in one scan or one each.
 - Progressive scans of every kind: DC and AC bands, end-of-band runs, and the
   refinement scans that add one more bit of precision at a time.
 - DQT, DHT, SOS, DRI and restart markers, byte stuffing and fill bytes; APPn

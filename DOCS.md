@@ -715,9 +715,7 @@ added, because Pillow always puts its IFD at byte 8.
 
 The encoder writes no EXIF. The decoder refuses
 lossless, hierarchical and 12-bit files (8-bit extended SOF1 files are read, and so are arithmetic coded ones),
-sampling other than 1x or 2x the chroma (4:1:1), and four components (CMYK). It ignores ICC profiles. A file with
-no JFIF or Adobe segment and components named R, G and B is read as YCbCr,
-where libjpeg would read it as RGB.
+sampling other than 1x or 2x the chroma (4:1:1), and four components (CMYK). It ignores ICC profiles.
 
 ## Arithmetic coding
 
@@ -790,3 +788,29 @@ compressed from the picture separately, not transcoded from `testorig.jpg`,
 and Pillow too reads the two up to 17 levels apart. Read by this decoder and
 by Pillow it differs by at most 3 levels, the same as any Huffman file does
 (see "Why it differs from Pillow by a few levels").
+
+## RGB or YCbCr, the way libjpeg guesses
+
+A JPEG with three components does not say outright what they are. libjpeg
+(`default_decompress_parms` in `jdapimin.c`) guesses in this order: a JFIF
+segment means YCbCr, whatever else the file says; failing that, an Adobe
+segment's transform byte decides, 0 for RGB and 1 for YCbCr; failing both,
+components numbered 1, 2 and 3 are YCbCr, components named `R`, `G` and `B`
+(82, 71, 66) are RGB, and anything else is YCbCr. The decoder used to look at
+the Adobe segment alone, so a file with no segments and R, G, B ids came out
+in the wrong colours, and so did one with both JFIF and an Adobe transform
+of 0, which libjpeg reads as YCbCr. It now follows the same order.
+
+The test starts from Pillow's `keep_rgb=True` files, which carry an Adobe
+segment with transform 0 and ids R, G and B, and makes four variants: the
+Adobe segment taken out, a JFIF segment put in front, both, and the
+transform byte set to 1. A plain 4:4:4 file with its JFIF segment taken out
+is the fifth. The expected pixels are Pillow's own decoding of each modified
+file, so libjpeg decides each case, not this code. A wrong guess is off by
+more than 140 levels, against the usual 3.
+
+Eight breakages were tried and all eight fail the test: JFIF never noticed,
+JFIF left out of the guess, the ids compared in the wrong order, never
+compared (the old code), always taken as RGB, an Adobe transform of 1
+overridden by the ids, JFIF matched on the wrong tag, and JFIF winning only
+when there is no Adobe segment.

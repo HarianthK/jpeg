@@ -1032,7 +1032,7 @@ def decode(data, upright=False):
     orientation = None
     if data[:2] != b"\xff\xd8":
         raise ValueError("not a JPEG: it does not start with SOI (FF D8)")
-    qt, huff, arith, frame, coefs, scans, interval, pos, transform = {}, {}, {}, None, {}, 0, 0, 2, 1
+    qt, huff, arith, frame, coefs, scans, interval, pos, transform, jfif = {}, {}, {}, None, {}, 0, 0, 2, None, False
     while True:
         if pos >= len(data):
             raise ValueError("the file ends before the EOI marker")
@@ -1056,6 +1056,8 @@ def decode(data, upright=False):
         body, pos = data[pos + 2:pos + n], pos + n
         if marker in (0xDB, 0xC4):
             read_tables(marker, body, qt, huff)
+        elif marker == 0xE0 and body[:5] == b"JFIF\0":
+            jfif = True
         elif marker == 0xEE and body[:5] == b"Adobe" and len(body) >= 12:
             transform = body[11]  # 0 means the three components are R, G and B, not YCbCr
         elif marker == 0xE1 and body[:6] == b"Exif\0\0" and orientation is None:
@@ -1087,7 +1089,9 @@ def decode(data, upright=False):
             scans += 1
     if not scans:
         raise ValueError("the file has no scan (SOS)")
-    picture = frame[0], frame[1], to_rgb(frame, to_planes(frame, coefs), transform == 0)
+    # libjpeg's guess: JFIF means YCbCr, else the Adobe transform, else components named R, G and B.
+    is_rgb = not jfif and (transform == 0 if transform is not None else [c["id"] for c in frame[2]] == [82, 71, 66])
+    picture = frame[0], frame[1], to_rgb(frame, to_planes(frame, coefs), is_rgb)
     return turn_upright(*picture, orientation) if upright and orientation not in (None, 1) else picture
 
 
