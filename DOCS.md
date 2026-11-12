@@ -814,3 +814,32 @@ JFIF left out of the guess, the ids compared in the wrong order, never
 compared (the old code), always taken as RGB, an Adobe transform of 1
 overridden by the ids, JFIF matched on the wrong tag, and JFIF winning only
 when there is no Adobe segment.
+
+## Reading the quality back out of a file
+
+A JPEG does not record the quality it was saved at, but libjpeg's tables give
+it away. Every IJG-style encoder, libjpeg and Pillow and this file among them,
+makes its quantization tables by scaling the two printed in the standard by a
+factor worked out from the quality. So `-i` tries all 100 qualities, scales the
+standard tables the same way, and keeps the one nearest the file's own: the sum
+of the differences, over the luma table and the chroma one if there is one. A
+difference of zero means the file was saved at that quality. Anything else is
+reported as the nearest, but not its tables: a camera or Photoshop writes
+tables of its own. The file stores its tables in zigzag order, so ours are put
+in that order before comparing.
+
+Some qualities give identical tables, near 100 and at the low end where 5000/q
+rounds the same way, and the file cannot tell them apart. The highest of them
+is reported.
+
+The check saves a picture through Pillow, which is libjpeg, at every quality
+from 1 to 100, in colour and in grey, and the answer must be that quality or
+one whose tables Pillow reads back the same. A file mixing quality 80's luma
+table with quality 30's chroma, and one with flat tables, must not be called
+exact. Pillow scales custom tables by the quality when one is given, which hid
+both from the first version of the check: they are now saved without one.
+
+Five breakages: ignoring zigzag order, ignoring the chroma table, reading only
+the first DQT segment, calling every match exact, and the command line saying
+"quality" for a near miss. Each fails the check. Ignoring chroma and reading only the
+first segment were missed until the mixed file was saved as given.

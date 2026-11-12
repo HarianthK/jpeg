@@ -145,6 +145,7 @@ lowest is 51.90 dB, and a flat colour at 4:4:4 comes out exactly equal. Restart 
 
     python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize] [--progressive [--refine]] [--restart N]
     python jpeg.py -d IN.jpg [-o OUT.png]
+    python jpeg.py -i FILE.jpg ...       # the quality setting each file was saved at, read from its tables
     python test_jpeg.py
 
 `--optimize` builds Huffman tables for the picture instead of using the

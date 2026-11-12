@@ -807,5 +807,40 @@ finally:
             os.remove(name)
 print("EXIF orientation 1 to 8, both byte orders, turned as Pillow's exif_transpose turns them; broken EXIF ignored")
 
+# Quality read back: libjpeg, through Pillow, saves at every quality 1 to 100, and the answer must be
+# that quality, or one whose tables libjpeg writes identically. Pillow's own reader gives the tables.
+def saved(q, image, **more):
+    out = io.BytesIO()
+    # With a quality, Pillow scales custom tables too; q=None writes them as given.
+    image.save(out, "JPEG", **({"quality": q} if q else {}), **more)
+    return out.getvalue()
+
+
+colour, grey = Image.new("RGB", (16, 16), (200, 30, 40)), Image.new("L", (16, 16), 90)
+tables = lambda data: Image.open(io.BytesIO(data)).quantization
+for image in (colour, grey):
+    for q in range(1, 101):
+        got, exact = jpeg.quality(saved(q, image))
+        check(exact and (got == q or tables(saved(got, image)) == tables(saved(q, image))), f"{image.mode} quality {q} read as {got}, {exact}")
+# Exact from both tables in colour: a chroma table from another quality is not a match.
+mixed = saved(None, colour, qtables=[tables(saved(80, colour))[0], tables(saved(30, colour))[1]])
+check(jpeg.quality(mixed)[1] is False, "luma from 80 and chroma from 30 called an IJG quality")
+check(jpeg.quality(saved(None, colour, qtables=[[3] * 64, [5] * 64]))[1] is False, "flat tables called an IJG quality")
+check(jpeg.quality(jpeg.encode(colour.tobytes(), 16, 16, 37)) == (37, True), "our own quality 37 not read back")
+try:
+    jpeg.quality(b"\xff\xd8\xff\xd9")
+    check(False, "a JPEG with no tables gave a quality")
+except ValueError:
+    pass
+open("t-q.jpg", "wb").write(saved(85, colour))
+open("t-flat.jpg", "wb").write(saved(None, colour, qtables=[[3] * 64, [5] * 64]))
+try:
+    run = subprocess.run([sys.executable, jpeg.__file__, "-i", "t-q.jpg", "t-flat.jpg"], capture_output=True, text=True)
+    check(run.returncode == 0 and "t-q.jpg: quality 85" in run.stdout and "t-flat.jpg: nearest IJG quality" in run.stdout, f"-i: {run}")
+finally:
+    for name in ("t-q.jpg", "t-flat.jpg"):
+        os.remove(name)
+print("quality read back from the tables at all 100 libjpeg settings, colour and grey; other tables flagged")
+
 print("FAILURES" if failures else "ok")
 sys.exit(1 if failures else 0)

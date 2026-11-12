@@ -1,5 +1,5 @@
 # Writes and reads baseline JPEGs: YCbCr, 8x8 DCT, quantization, zigzag, then Huffman coding.
-# Run: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize], or -d IN.jpg [-o OUT.png]
+# Run: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize], or -d IN.jpg [-o OUT.png], or -i FILE.jpg ...
 import math
 import struct
 import sys
@@ -1025,6 +1025,25 @@ def turn_upright(width, height, rgb, orientation):
     return width, height, b"".join(p for r in rows for p in r)
 
 
+def quality(data):
+    # The IJG quality whose tables are nearest the file's, and whether they match it exactly.
+    qt, pos = {}, 2
+    while pos + 4 <= len(data) and data[pos] == 0xFF and data[pos + 1] not in (0xDA, 0xD9):
+        n = int.from_bytes(data[pos + 2:pos + 4], "big")
+        if data[pos + 1] == 0xDB:
+            read_tables(0xDB, data[pos + 4:pos + 2 + n], qt, {})
+        pos += 2 + n
+    if 0 not in qt:
+        raise ValueError("no quantization table before the first scan")
+    off = {}
+    for q in range(1, 101):
+        # The file holds its tables in zigzag order; ours are row by row.
+        tables = [[t[i] for i in ZIGZAG] for t in quant_tables(q)]
+        off[q] = sum(abs(a - b) for slot in (0, 1) if slot in qt for a, b in zip(qt[slot], tables[slot]))
+    best = min(off, key=lambda q: (off[q], -q))
+    return best, off[best] == 0
+
+
 def decode(data, upright=False):
     # Returns width, height and the RGB pixels, row by row, of a baseline or progressive JPEG.
     # Anything else is refused with a ValueError. upright=True applies the EXIF orientation, as viewers do.
@@ -1100,9 +1119,20 @@ if __name__ == "__main__":
     args = [a for i, a in enumerate(argv) if not a.startswith("-") and (i == 0 or argv[i - 1] not in ("-o", "-q", "--restart"))]
     if not args:
         sys.exit("usage: python jpeg.py IN.png [-o OUT.jpg] [-q 75] [--444] [--grey] [--optimize] [--progressive [--refine]] [--restart N]\n"
-                 "       python jpeg.py -d IN.jpg [-o OUT.png]")
+                 "       python jpeg.py -d IN.jpg [-o OUT.png]\n       python jpeg.py -i FILE.jpg ...")
     from PIL import Image  # only to read or write the PNG; the JPEG is all this file
     source = args[0]
+    if "-i" in argv:
+        # As ImageMagick's identify -verbose: the quality setting read back from the tables.
+        bad = 0
+        for name in args:
+            try:
+                q, exact = quality(open(name, "rb").read())
+                print(f"{name}: quality {q}" if exact else f"{name}: nearest IJG quality {q}, but not its tables")
+            except (OSError, ValueError) as e:
+                print(f"{name}: {e}", file=sys.stderr)
+                bad += 1
+        sys.exit(1 if bad else 0)
     if "-d" in argv:
         out = argv[argv.index("-o") + 1] if "-o" in argv else source.rsplit(".", 1)[0] + ".png"
         packed = open(source, "rb").read()
